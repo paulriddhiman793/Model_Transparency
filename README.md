@@ -5,7 +5,7 @@ understanding what happened during training, not just final metrics.
 
 It produces a structured, step-by-step report for both classification and regression models.
 
-## What The Pipeline Now Covers
+## What The Pipeline Covers
 
 `run_pipeline(...)` runs the following stages:
 
