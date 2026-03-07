@@ -1,94 +1,117 @@
 # Model Transparency Pipeline
 
-This repository is built to answer one question clearly:
+This project is a terminal-first ML diagnostics pipeline focused on one thing:
+understanding what happened during training, not just final metrics.
 
-**What happened during model training, and why did the model make these predictions?**
+It produces a structured, step-by-step report for both classification and regression models.
 
-Instead of only giving final metrics, it prints a detailed, step-by-step training narrative in the terminal.
+## What The Pipeline Now Covers
 
-## What This Repo Tells You About Training
+`run_pipeline(...)` runs the following stages:
 
-When you run `run_pipeline(...)`, you get a structured report across 9 stages:
+1. **Step 0 - Dataset Health Report**
+- Missing values by feature with severity levels
+- Class imbalance / target skew checks
+- Constant and low-variance feature detection
+- Multicollinearity scan (feature-feature correlation)
+- Feature leakage risk scan (very high feature-target correlation)
+- Dataset size and samples-per-feature risk checks
+- Duplicate row detection
+- Outlier detection (z-score based)
+- Final health scorecard with critical/warning issues and suggested fixes
 
-1. **Data Analysis**
-- Dataset shape, feature count, and target profile
-- Class balance (for classification) or target distribution stats (for regression)
-- Feature summary stats and top correlations with target
+2. **Step 1 - Data Analysis**
+- Dataset shape and feature summary
+- Target distribution details
+- Feature stats (mean/std/min/max/NaNs)
+- Top target correlations for regression
 
-2. **Preprocessing**
-- Exact train/test split sizes
-- Whether scaling was applied
-- Per-feature `StandardScaler` means/stds (first features shown)
-- Before/after sample values to verify transformations
+3. **Step 2 - Preprocessing**
+- Train/test split details
+- Optional `StandardScaler` diagnostics (means/stds, before/after sample values)
+- Clear leakage-safe scaling note (fit on train only)
 
-3. **Training Diagnostics**
-- Model class and key hyperparameters
-- Fit time
-- Quick visibility into what the model was configured to learn
+4. **Step 3 - Training**
+- Model class and key parameters
+- Fit timing
 
-4. **Model Internals (model-specific explainers)**
-- Linear/logistic/SGD: coefficients, intercept, equation preview, strongest weights
-- Decision tree: node counts, depth, split preview, impurity-based importances
-- Random forest: estimator count, depth distribution, OOB stats, aggregated importances
-- Gradient boosting: stage-wise loss behavior, learning-rate effects, importances
-- SVM: kernel, support vectors, margin intuition
-- KNN: neighbor mechanics and distance setup
-- XGBoost/LightGBM (if installed): boosted-tree internals and feature influence
+5. **Step 3.5 - Training Decision Explanations**
+- Explains why splits/weights were chosen during learning
+- Tree families: split-quality rationale
+- Linear families: coefficient and regularization behavior
+- Dedicated paths for XGBoost and LightGBM when installed
 
-5. **Prediction Walkthrough (sample-by-sample)**
-- Shows test samples and predicted outputs
-- For classification: correctness + class probabilities (if available)
-- For regression: per-sample absolute errors
+6. **Step 4 - Model Internals Deep Dive**
+- Model-specific internals for linear, tree, forest, GBM, SVM, KNN, XGBoost, LightGBM
 
-6. **Evaluation Metrics**
+7. **Step 5 - Prediction Walkthrough**
+- Sample-by-sample prediction decomposition
+- Classification confidence/probabilities when available
+- Per-sample regression error details
+
+8. **Step 6 - Evaluation Metrics**
 - Classification: accuracy, report, confusion matrix
 - Regression: MSE, MAE, RMSE, R2
-- Train vs test behavior for overfit/underfit signals
 
-7. **Validation Strategy**
-- Cross-validation summary
-- Adaptive behavior for larger datasets (faster validation strategy)
-- Helps judge whether observed test performance is stable
+9. **Step 6.5 - Overfitting Diagnosis Engine**
+- Train/test gap-based regime detection:
+  - `HEALTHY`
+  - `MILD_OVERFIT`
+  - `OVERFITTING`
+  - `UNDERFITTING`
+  - `SUSPICIOUS` (test > train)
+- Model-aware cause analysis and targeted fix suggestions
+- Mini learning-curve simulation across training fractions
+- Complexity-vs-performance summary
 
-8. **Permutation Feature Importance**
-- Global feature influence using permutation on test data
-- Works as a model-agnostic check against built-in model importances
+10. **Step 7 - Smart Validation**
+- Auto-selects validation method by model family and dataset size:
+  - Forest/Bagging models: OOB scoring path
+  - XGBoost/LightGBM: early-stopping style validation path
+  - `< 5,000` samples: full k-fold CV
+  - `5,000 to < 50,000`: ShuffleSplit
+  - `>= 50,000`: holdout-only path
+- Stability verdict based on score variance across splits
 
-9. **Learning Trace (how the model learned)**
-- Deeper training-process interpretation by model family
-- Examples include split-building logic (trees), round-wise improvements (boosting), coefficient/loss behavior (linear/SGD), neighborhood behavior (KNN), and support vector effects (SVM)
+11. **Step 8 - Permutation Importance**
+- Model-agnostic feature importance with uncertainty estimates
+
+12. **Step 9 - Learning Trace**
+- Family-specific deep trace of how learning progressed (splits, coefficients, margins, neighbors, boosting rounds)
 
 ## Why This Is Useful
 
-Use this repo when you need to:
-
-- Debug why a model is overfitting or underperforming
-- Explain model behavior to teammates/stakeholders
-- Compare model families beyond a single score
-- Inspect whether preprocessing and scaling are behaving correctly
-- Get interpretable training output without notebooks or dashboards
+- Catches dataset problems before training starts
+- Explains model behavior in human terms, not just scores
+- Surfaces overfitting causes and concrete remediation ideas
+- Adapts validation strategy to scale for faster but reliable diagnostics
+- Makes model review reproducible in plain terminal output
 
 ## Repository Structure
 
-- `model_transparency.py`: Main pipeline, explainers, and optional Optuna tuning
-- `run_demo.py`: Minimal example (XGBoost classifier on toy data)
+- `model_transparency.py`: Main pipeline, model explainers, validation engine, Optuna tuning
+- `run_demo.py`: Small XGBoost classification demo
 
 ## Supported Models
+
+Deep explainers and/or traces are included for:
 
 - Linear: `LinearRegression`, `LogisticRegression`, `Ridge`, `Lasso`, `ElasticNet`, `SGDClassifier`, `SGDRegressor`
 - Tree/ensemble: `DecisionTree*`, `RandomForest*`, `GradientBoosting*`
 - Margin/distance: `SVC`, `SVR`, `KNeighbors*`
-- Optional: `XGBClassifier`/`XGBRegressor`, `LGBMClassifier`/`LGBMRegressor`
+- Optional: `XGBClassifier` / `XGBRegressor`, `LGBMClassifier` / `LGBMRegressor`
+
+The pipeline also accepts other sklearn-compatible estimators; unsupported families fall back to generic diagnostics where needed.
 
 ## Installation
 
-Install base dependencies:
+Base dependencies:
 
 ```bash
 pip install numpy pandas scikit-learn
 ```
 
-Optional integrations:
+Optional dependencies:
 
 ```bash
 pip install xgboost lightgbm optuna
@@ -117,15 +140,15 @@ trained_model, scaler = run_pipeline(
     model,
     X, y,
     feature_names=["hours_studied", "attendance_pct", "prev_score", "assignments_done"],
-    task_type="classification",  # optional; auto-inferred if omitted
+    task_type="classification",  # optional, auto-inferred if omitted
     test_size=0.25,
-    scale=False,                 # tree models typically do not need scaling
+    scale=False,                 # tree models usually do not need scaling
     cv=3,
     n_walkthrough=3,
 )
 ```
 
-## API Reference
+## API
 
 ### `run_pipeline(...)`
 
@@ -143,24 +166,14 @@ run_pipeline(
 )
 ```
 
-Parameters:
-
-- `model`: sklearn-compatible estimator instance
-- `X`: `np.ndarray` or `pd.DataFrame`
-- `y`: `np.ndarray` or `pd.Series`
-- `feature_names`: optional names (auto-filled from DataFrame columns)
-- `task_type`: `"classification"` or `"regression"` (auto-detected if `None`)
-- `test_size`: holdout fraction
-- `scale`: apply `StandardScaler`
-- `cv`: CV folds in validation stage
-- `n_walkthrough`: number of test samples to explain in detail
-
 Returns:
 
-- `model`: fitted model
-- `scaler`: fitted scaler or `None`
+- fitted `model`
+- fitted `scaler` (or `None`)
 
 ### `tune_model(...)` (Optuna)
+
+Runs Optuna tuning, prints live trial progress, shows best-trial analysis, then hands the best model to `run_pipeline(...)`.
 
 ```python
 tune_model(
@@ -176,19 +189,13 @@ tune_model(
 )
 ```
 
-What it adds:
-
-- Model-family-specific hyperparameter search spaces
-- Trial-by-trial CV optimization
-- Final run through the same transparency pipeline with best params
-
 Returns:
 
 - `best_model`
 - `scaler`
 - `study` (`optuna.study.Study`)
 
-## Running Demos
+## Demos
 
 Run built-in demos:
 
@@ -196,27 +203,21 @@ Run built-in demos:
 python model_transparency.py
 ```
 
-Run the custom XGBoost demo:
+Run custom XGBoost demo:
 
 ```bash
 python run_demo.py
 ```
 
-`run_demo.py` requires `xgboost` to be installed.
+`run_demo.py` imports `xgboost` directly, so install `xgboost` first.
 
-## Practical Interpretation Tips
+## Notes
 
-- If train is much better than test in Step 6, check model complexity and Step 7 CV spread.
-- If a feature looks important in built-in importance but weak in Step 8 permutation, treat it as unstable.
-- For linear/SGD models, use coefficient magnitudes and signs to inspect directional effects.
-- For tree/boosting models, use split/importance outputs plus prediction walkthroughs to confirm behavior.
-
-## Limitations
-
-- Terminal output is intentionally verbose and not optimized for production logging pipelines.
-- Explanations are model-family heuristics plus diagnostics, not formal causal inference.
-- No visualization dashboard is included; output is text-first.
+- Output is intentionally verbose and terminal-centric.
+- If `task_type` is omitted, it is inferred automatically.
+- `tune_model(...)` requires `optuna`.
 
 ## License
 
-No license file is currently present. Add a `LICENSE` file before public distribution.
+No license file is currently included.
+Add a `LICENSE` file if you plan to distribute this publicly.
