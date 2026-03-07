@@ -119,6 +119,232 @@ def progress_bar(current, total, label="", width=40):
 #  STEP 1 — DATA ANALYSIS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  STEP 0 — DATASET HEALTH REPORT
+#  Runs before anything else. Catches data problems that will silently
+#  corrupt every downstream result if not caught here.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def dataset_health_report(X, y, feature_names, task_type):
+    banner("STEP 0 — DATASET HEALTH REPORT")
+
+    issues   = []   # (severity, message, detail)
+    n, p     = X.shape
+    is_clf   = task_type == "classification"
+
+    # ── 1. Missing values ─────────────────────────────────────────────────────
+    section("Missing Values")
+    nan_counts = np.sum(np.isnan(X), axis=0)
+    total_nans = int(nan_counts.sum())
+    if total_nans == 0:
+        print("  ✅ No missing values detected")
+    else:
+        for i, name in enumerate(feature_names):
+            if nan_counts[i] > 0:
+                pct = nan_counts[i] / n * 100
+                sev = "🔴 CRITICAL" if pct > 30 else "🟡 WARNING"
+                print(f"  {sev}  {name:<25}: {nan_counts[i]} missing  ({pct:.1f}%)")
+                issues.append(("WARNING", f"{name} has {pct:.1f}% missing values",
+                               "Impute or drop before training"))
+
+    # ── 2. Class imbalance ────────────────────────────────────────────────────
+    section("Class Imbalance" if is_clf else "Target Distribution")
+    if is_clf:
+        counts      = Counter(y)
+        majority    = max(counts.values())
+        minority    = min(counts.values())
+        imb_ratio   = majority / minority
+        print(f"  Class counts:  {dict(sorted(counts.items()))}")
+        print(f"  Imbalance ratio: {imb_ratio:.2f}x  (1.0 = perfectly balanced)")
+        if imb_ratio > 10:
+            print(f"  🔴 SEVERE IMBALANCE — minority class has only {minority} samples")
+            print(f"     → Use: SMOTE, class_weight='balanced', or stratified sampling")
+            issues.append(("CRITICAL", f"Severe class imbalance ({imb_ratio:.1f}x)",
+                           "Use class_weight='balanced' or SMOTE"))
+        elif imb_ratio > 3:
+            print(f"  🟡 MODERATE IMBALANCE — accuracy will be misleading")
+            print(f"     → Use: F1/AUC metrics instead of accuracy")
+            issues.append(("WARNING", f"Moderate class imbalance ({imb_ratio:.1f}x)",
+                           "Prefer F1/AUC over accuracy"))
+        else:
+            print(f"  ✅ Balanced  (ratio={imb_ratio:.2f}x)")
+    else:
+        skew = float(np.mean((y - np.mean(y))**3) / (np.std(y)**3 + 1e-9))
+        print(f"  Target mean:    {np.mean(y):.4f}")
+        print(f"  Target std:     {np.std(y):.4f}")
+        print(f"  Skewness:       {skew:.4f}")
+        if abs(skew) > 2:
+            print(f"  🟡 HIGH SKEW — consider log-transforming the target")
+            issues.append(("WARNING", f"Target skewness={skew:.2f}",
+                           "Consider log1p(y) transformation"))
+        else:
+            print(f"  ✅ Target distribution looks reasonable")
+
+    # ── 3. Feature variance ───────────────────────────────────────────────────
+    section("Low-Variance / Constant Features")
+    zero_var = []
+    low_var  = []
+    for i, name in enumerate(feature_names):
+        v = float(np.var(X[:, i]))
+        if v < 1e-10:
+            zero_var.append(name)
+        elif v < 0.01:
+            low_var.append((name, v))
+    if zero_var:
+        for name in zero_var:
+            print(f"  🔴 CONSTANT   {name:<25}: variance ≈ 0  (carries no information)")
+        issues.append(("CRITICAL", f"Constant features: {zero_var}",
+                       "Drop these — they cannot help any model"))
+    if low_var:
+        for name, v in low_var:
+            print(f"  🟡 LOW VAR    {name:<25}: variance={v:.6f}")
+        issues.append(("WARNING", f"{len(low_var)} near-constant features",
+                       "Consider dropping or binning"))
+    if not zero_var and not low_var:
+        print(f"  ✅ All features have reasonable variance")
+
+    # ── 4. Multicollinearity ──────────────────────────────────────────────────
+    section("Multicollinearity (Feature–Feature Correlation)")
+    print("  Checking all feature pairs for high correlation (|r| > 0.85):\n")
+    high_corr_pairs = []
+    for i in range(p):
+        for j in range(i+1, p):
+            if p > 50 and j - i > 20:   # skip distant pairs for huge datasets
+                continue
+            r = float(np.corrcoef(X[:, i], X[:, j])[0, 1])
+            if abs(r) > 0.85:
+                high_corr_pairs.append((feature_names[i], feature_names[j], r))
+
+    if not high_corr_pairs:
+        print("  ✅ No highly correlated feature pairs found (|r| ≤ 0.85)")
+    else:
+        high_corr_pairs.sort(key=lambda x: abs(x[2]), reverse=True)
+        for f1, f2, r in high_corr_pairs[:10]:
+            sev = "🔴" if abs(r) > 0.95 else "🟡"
+            bar = "█" * int(abs(r) * 30)
+            print(f"  {sev} {f1[:18]:<18} ↔  {f2[:18]:<18}  r={r:+.4f}  {bar}")
+        print(f"\n  High correlation means these features carry redundant information.")
+        print(f"  → Tree models handle it. Linear models, KNN, SVM are affected.")
+        issues.append(("WARNING", f"{len(high_corr_pairs)} highly correlated feature pairs",
+                       "Consider PCA or dropping one of each pair for linear models"))
+
+    # ── 5. Feature leakage risk ───────────────────────────────────────────────
+    section("Feature Leakage Risk")
+    print("  Checking if any feature correlates suspiciously strongly with target:\n")
+    leakage_found = False
+    if is_clf:
+        y_num = y.astype(float)
+    else:
+        y_num = y.astype(float)
+
+    leakage_pairs = []
+    for i, name in enumerate(feature_names):
+        col = X[:, i].astype(float)
+        col_std = col.std()
+        if col_std < 1e-10:
+            continue
+        r = float(np.corrcoef(col, y_num)[0, 1])
+        if abs(r) > 0.95:
+            leakage_pairs.append((name, r))
+
+    if not leakage_pairs:
+        print("  ✅ No obvious leakage signals (no feature with |r| > 0.95 to target)")
+    else:
+        for name, r in sorted(leakage_pairs, key=lambda x: abs(x[1]), reverse=True):
+            print(f"  🔴 LEAKAGE RISK  {name:<25}: r={r:+.4f} with target")
+            print(f"     Verify this feature is not derived from the target")
+        issues.append(("CRITICAL", "Possible feature leakage detected",
+                       "Verify features are not computed from the target variable"))
+        leakage_found = True
+
+    # ── 6. Dataset size warnings ──────────────────────────────────────────────
+    section("Dataset Size")
+    samples_per_feature = n / p
+    print(f"  Samples:                {n}")
+    print(f"  Features:               {p}")
+    print(f"  Samples per feature:    {samples_per_feature:.1f}")
+
+    if n < 100:
+        print(f"  🔴 VERY SMALL DATASET — results will be highly sensitive to split")
+        print(f"     → Use Leave-One-Out CV or heavy regularization")
+        issues.append(("CRITICAL", f"Only {n} samples",
+                       "Use LOO-CV; any single result is unreliable"))
+    elif n < 500:
+        print(f"  🟡 SMALL DATASET — use cross-validation, not a single split")
+        issues.append(("WARNING", f"Small dataset ({n} samples)",
+                       "Cross-validation essential; avoid complex models"))
+    else:
+        print(f"  ✅ Dataset size is adequate")
+
+    if samples_per_feature < 5:
+        print(f"  🔴 TOO FEW SAMPLES PER FEATURE ({samples_per_feature:.1f})")
+        print(f"     → Severe overfitting risk. Drop features or collect more data.")
+        issues.append(("CRITICAL", f"Only {samples_per_feature:.1f} samples/feature",
+                       "High overfit risk — reduce features or collect more data"))
+    elif samples_per_feature < 10:
+        print(f"  🟡 LOW SAMPLES/FEATURE RATIO ({samples_per_feature:.1f}) — be cautious")
+
+    # ── 7. Duplicate rows ────────────────────────────────────────────────────
+    section("Duplicate Rows")
+    uniq = len(np.unique(X, axis=0))
+    dups = n - uniq
+    if dups > 0:
+        pct = dups / n * 100
+        sev = "🔴" if pct > 10 else "🟡"
+        print(f"  {sev} {dups} duplicate rows found ({pct:.1f}% of data)")
+        issues.append(("WARNING", f"{dups} duplicate rows ({pct:.1f}%)",
+                       "Duplicates can inflate CV scores — deduplicate before training"))
+    else:
+        print(f"  ✅ No duplicate rows found")
+
+    # ── 8. Outlier detection ──────────────────────────────────────────────────
+    section("Outlier Detection (Z-score > 3.5)")
+    total_outliers = 0
+    outlier_features = []
+    for i, name in enumerate(feature_names):
+        col  = X[:, i].astype(float)
+        std  = col.std()
+        if std < 1e-10:
+            continue
+        z    = np.abs((col - col.mean()) / std)
+        n_out = int(np.sum(z > 3.5))
+        if n_out > 0:
+            total_outliers += n_out
+            outlier_features.append((name, n_out, float(np.max(z))))
+            bar = "█" * min(n_out, 20)
+            print(f"  🟡 {name:<25}: {n_out} outlier(s)  max_z={np.max(z):.2f}  {bar}")
+
+    if total_outliers == 0:
+        print(f"  ✅ No extreme outliers detected (z-score threshold: 3.5)")
+    else:
+        print(f" Total outlier samples: {total_outliers}")
+        print(f"  → Tree models are robust. Linear/KNN/SVM are sensitive to outliers.")
+        issues.append(("WARNING", f"{total_outliers} outlier values detected",
+                       "Consider RobustScaler or winsorization for linear/SVM/KNN models"))
+
+    # ── 9. Summary scorecard ──────────────────────────────────────────────────
+    section("Health Scorecard")
+    critical = [i for i in issues if i[0] == "CRITICAL"]
+    warnings = [i for i in issues if i[0] == "WARNING"]
+
+    if not issues:
+        print("  ✅ HEALTHY — No significant data quality issues detected")
+        print("     Dataset looks ready for modelling.")
+    else:
+        if critical:
+            print(f"  🔴 {len(critical)} CRITICAL issue(s) — fix before trusting results: ")
+            for _, msg, fix in critical:
+                print(f"     • {msg}")
+                print(f"       Fix: {fix}")
+        if warnings:
+            print(f" 🟡 {len(warnings)} WARNING(s) — worth investigating: ")
+            for _, msg, fix in warnings:
+                print(f"     • {msg}")
+                print(f"       Fix: {fix}")
+
+    return issues
+
+
 def analyze_data(X, y, feature_names, task_type):
     banner("STEP 1 — DATA ANALYSIS")
 
@@ -424,6 +650,401 @@ def explain_lgbm(model, feature_names):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  STEP 3.5 — TRAINING DECISION EXPLANATIONS
+#  Answers: WHY did the model make each split? What impurity was reduced?
+#  How was each feature chosen over the alternatives?
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _explain_xgb_decisions(model, feature_names, X_train, y_train):
+    """Tree split decisions for XGBoost — gain, cover, why this feature won."""
+    import re
+    booster   = model.get_booster()
+    all_trees = booster.get_dump(with_stats=True)
+    n_trees   = len(all_trees)
+
+    section("XGBoost Split Decisions — Why Each Feature Was Chosen")
+    print(textwrap.fill(
+        "  Each split was chosen because it gave the highest GAIN "
+        "(reduction in loss) among all possible features and thresholds. "
+        "Cover = weighted number of samples that reached this node.",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+    print()
+
+    # Collect all splits with gain/cover
+    all_splits = []
+    for t_idx, tree_str in enumerate(all_trees):
+        for line in tree_str.split("\n"):
+            m = re.search(
+                r'\[f(\d+)<([\d.\-eE+]+)\].*gain=([\d.\-eE+]+).*cover=([\d.\-eE+]+)',
+                line)
+            if m:
+                fi     = int(m.group(1))
+                thresh = float(m.group(2))
+                gain   = float(m.group(3))
+                cover  = float(m.group(4))
+                name   = feature_names[fi] if fi < len(feature_names) else f"f{fi}"
+                all_splits.append((t_idx+1, name, thresh, gain, cover))
+
+    # Top splits by gain
+    subsection("Top 10 Most Impactful Splits (by gain)")
+    print(f"  {'Tree':>5}  {'Feature':<25} {'Threshold':>11}  "
+          f"{'Gain':>10}  {'Cover':>8}  Impact bar")
+    print("  " + "─" * 75)
+    sorted_splits = sorted(all_splits, key=lambda x: x[3], reverse=True)
+    max_gain = sorted_splits[0][3] if sorted_splits else 1.0
+    for tree_n, name, thresh, gain, cover in sorted_splits[:10]:
+        bar = "█" * int(gain / max_gain * 35)
+        print(f"  {tree_n:>5}  {name:<25} {thresh:>11.4f}  "
+              f"{gain:>10.4f}  {cover:>8.2f}  {bar}")
+
+    # Per-feature decision summary
+    subsection("Per-Feature: Total Gain Contributed Across All Splits")
+    feat_gain  = {}
+    feat_count = {}
+    feat_cover = {}
+    for _, name, _, gain, cover in all_splits:
+        feat_gain[name]  = feat_gain.get(name, 0.0)  + gain
+        feat_count[name] = feat_count.get(name, 0)   + 1
+        feat_cover[name] = feat_cover.get(name, 0.0) + cover
+
+    total_gain = sum(feat_gain.values()) + 1e-9
+    print(f"  {'Feature':<25} {'Splits':>7}  {'Total Gain':>12}  "
+          f"{'% of Gain':>10}  {'Avg Cover':>10}")
+    print("  " + "─" * 70)
+    for name in sorted(feat_gain, key=feat_gain.get, reverse=True):
+        pct = feat_gain[name] / total_gain * 100
+        avg_cover = feat_cover[name] / feat_count[name]
+        bar = "█" * int(pct * 0.4)
+        print(f"  {name:<25} {feat_count[name]:>7}  {feat_gain[name]:>12.4f}  "
+              f"{pct:>9.1f}%  {avg_cover:>10.2f}  {bar}")
+
+    # Why the first split? Explain it
+    if sorted_splits:
+        subsection("Deep Dive: The Single Most Important Split")
+        tree_n, name, thresh, gain, cover = sorted_splits[0]
+        print(f"  Tree #{tree_n}  split on  '{name}'  at threshold  {thresh:.4f}")
+        print()
+        fi = feature_names.index(name) if name in feature_names else -1
+        if fi >= 0:
+            below = X_train[X_train[:, fi] <= thresh]
+            above = X_train[X_train[:, fi] >  thresh]
+            y_below = y_train[X_train[:, fi] <= thresh]
+            y_above = y_train[X_train[:, fi] >  thresh]
+            print(f"  Samples going LEFT  ({name} ≤ {thresh:.4f}):  {len(below)} samples")
+            print(f"  Samples going RIGHT ({name} > {thresh:.4f}):  {len(above)} samples")
+            if len(y_below) > 0:
+                lb = Counter(y_below.tolist())
+                print(f"    LEFT  class distribution:  {dict(lb)}")
+            if len(y_above) > 0:
+                ra = Counter(y_above.tolist())
+                print(f"    RIGHT class distribution:  {dict(ra)}")
+        print(f"  Gain from this split:  {gain:.4f}  "
+              f"(higher = more impurity reduced)")
+        print(f"  Cover at this node:    {cover:.2f}  "
+              f"(weighted samples passing through)")
+
+
+def _explain_tree_decisions(model, feature_names, X_train, y_train, task_type):
+    """Split decisions for sklearn DecisionTree — gini/entropy/mse reduction."""
+    from sklearn.tree import _tree
+    tree    = model.tree_
+    is_clf  = task_type == "classification"
+    crit    = model.criterion
+
+    section(f"Decision Tree Split Decisions  (criterion: {crit})")
+    print(textwrap.fill(
+        f"  Each internal node chose the feature that maximally reduced {crit}. "
+        "The impurity reduction (= gain) tells you exactly HOW MUCH each split helped.",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+    print()
+
+    # Walk all internal nodes
+    splits = []
+    for node in range(tree.node_count):
+        if tree.children_left[node] == _tree.TREE_LEAF:
+            continue
+        fi     = tree.feature[node]
+        thresh = tree.threshold[node]
+        name   = feature_names[fi] if fi < len(feature_names) else f"f{fi}"
+        n_node = tree.n_node_samples[node]
+        impurity_parent = tree.impurity[node]
+        n_left  = tree.n_node_samples[tree.children_left[node]]
+        n_right = tree.n_node_samples[tree.children_right[node]]
+        imp_l   = tree.impurity[tree.children_left[node]]
+        imp_r   = tree.impurity[tree.children_right[node]]
+        # Weighted impurity reduction
+        reduction = (impurity_parent
+                     - (n_left/n_node) * imp_l
+                     - (n_right/n_node) * imp_r)
+        depth = 0
+        n = node
+        while n != 0:
+            # climb to root to get depth
+            for nd in range(tree.node_count):
+                if tree.children_left[nd] == n or tree.children_right[nd] == n:
+                    n = nd
+                    depth += 1
+                    break
+            else:
+                break
+        splits.append((depth, node, name, thresh, reduction, n_node, imp_l, imp_r))
+
+    splits.sort(key=lambda x: x[4], reverse=True)
+
+    subsection(f"All Splits Ranked by {crit} Reduction")
+    print(f"  {'Depth':>6}  {'Feature':<25} {'Threshold':>11}  "
+          f"{'Reduction':>11}  {'Samples':>8}  Importance bar")
+    print("  " + "─" * 75)
+    max_red = splits[0][4] if splits else 1.0
+    for depth, node, name, thresh, red, n_samp, il, ir in splits[:15]:
+        bar = "█" * int(max(red/max_red * 35, 0))
+        print(f"  {'  '*min(depth,3)}{depth:>4}  {name:<25} {thresh:>11.4f}  "
+              f"{red:>11.6f}  {n_samp:>8}  {bar}")
+
+    if splits:
+        subsection("Why the Root Split Was Chosen")
+        depth, node, name, thresh, red, n_samp, il, ir = sorted(splits, key=lambda x: x[0])[0]
+        fi = feature_names.index(name) if name in feature_names else -1
+        print(f"  Root split: '{name}' <= {thresh:.4f}")
+        print(f"  {crit} before split:    {tree.impurity[0]:.6f}")
+        print(f"  {crit} after  split:    L={il:.6f}  R={ir:.6f}")
+        print(f"  {crit} reduction:       {red:.6f}  ← this is why this feature was chosen")
+        print()
+        print(f"  Interpretation:")
+        if is_clf:
+            if crit == "gini":
+                print(f"    Gini impurity = 0 means a pure node (all same class).")
+                print(f"    Gini impurity = 0.5 means 50/50 split (worst case, 2 classes).")
+            else:
+                print(f"    Entropy = 0 means a pure node. Entropy = 1 means max uncertainty.")
+        else:
+            print(f"    MSE/variance reduction: lower = more homogeneous children.")
+        if fi >= 0:
+            below = y_train[X_train[:, fi] <= thresh]
+            above = y_train[X_train[:, fi] >  thresh]
+            if is_clf:
+                print(f"    LEFT  (≤{thresh:.4f}):  {Counter(below.tolist())}")
+                print(f"    RIGHT (> {thresh:.4f}):  {Counter(above.tolist())}")
+            else:
+                print(f"    LEFT  (≤{thresh:.4f}):  mean={np.mean(below):.4f}  std={np.std(below):.4f}")
+                print(f"    RIGHT (> {thresh:.4f}):  mean={np.mean(above):.4f}  std={np.std(above):.4f}")
+
+
+def _explain_forest_decisions(model, feature_names, X_train, y_train, task_type):
+    """Aggregate split decisions across all trees in a Random Forest."""
+    from sklearn.tree import _tree
+    is_clf = task_type == "classification"
+    crit   = model.criterion
+
+    section(f"Random Forest Split Decisions  (criterion: {crit})")
+    print(textwrap.fill(
+        "  Aggregating split decisions from ALL trees. "
+        "Each tree votes independently — the most used features and thresholds "
+        "reveal what the ensemble collectively considers informative.",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+    print()
+
+    feat_gain  = {}
+    feat_count = {}
+    all_splits = []
+
+    for est in model.estimators_:
+        tree = est.tree_
+        for node in range(tree.node_count):
+            if tree.children_left[node] == _tree.TREE_LEAF:
+                continue
+            fi     = tree.feature[node]
+            thresh = tree.threshold[node]
+            name   = feature_names[fi] if fi < len(feature_names) else f"f{fi}"
+            n_node = tree.n_node_samples[node]
+            n_l    = tree.n_node_samples[tree.children_left[node]]
+            n_r    = tree.n_node_samples[tree.children_right[node]]
+            imp_p  = tree.impurity[node]
+            imp_l  = tree.impurity[tree.children_left[node]]
+            imp_r  = tree.impurity[tree.children_right[node]]
+            red    = imp_p - (n_l/n_node)*imp_l - (n_r/n_node)*imp_r
+            feat_gain[name]  = feat_gain.get(name, 0.0) + red
+            feat_count[name] = feat_count.get(name, 0)   + 1
+            all_splits.append((name, thresh, red))
+
+    subsection("Feature Decision Power (total impurity reduction summed across all trees)")
+    total_gain = sum(feat_gain.values()) + 1e-9
+    print(f"  {'Feature':<25} {'Total Splits':>13}  {'Total Reduction':>16}  "
+          f"{'% of Power':>11}")
+    print("  " + "─" * 72)
+    for name in sorted(feat_gain, key=feat_gain.get, reverse=True):
+        pct = feat_gain[name] / total_gain * 100
+        avg = feat_gain[name] / feat_count[name]
+        bar = "█" * int(pct * 0.4)
+        print(f"  {name:<25} {feat_count[name]:>13}  {feat_gain[name]:>16.4f}  "
+              f"{pct:>10.1f}%  {bar}")
+
+    subsection("Top 10 Individual Splits Across ALL Trees")
+    sorted_splits = sorted(all_splits, key=lambda x: x[2], reverse=True)[:10]
+    print(f"  {'Feature':<25} {'Threshold':>11}  {'Reduction':>12}  Gain bar")
+    print("  " + "─" * 60)
+    max_red = sorted_splits[0][2] if sorted_splits else 1.0
+    for name, thresh, red in sorted_splits:
+        bar = "█" * int(red/max_red * 30)
+        print(f"  {name:<25} {thresh:>11.4f}  {red:>12.6f}  {bar}")
+
+
+def _explain_gbm_decisions(model, feature_names, X_train, y_train, task_type):
+    """Split decisions for sklearn GradientBoosting."""
+    from sklearn.tree import _tree
+    is_clf = task_type == "classification"
+
+    section("Gradient Boosting Split Decisions")
+    print(textwrap.fill(
+        "  GBM splits target the NEGATIVE GRADIENT (pseudo-residuals). "
+        "Early trees make large corrections; later trees make fine-grained adjustments. "
+        "The gain here measures how much each split reduced the residual variance.",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+    print()
+
+    feat_gain  = {}
+    feat_count = {}
+    stage_gains = []  # gain per stage (tree)
+
+    for stage_idx, est_arr in enumerate(model.estimators_):
+        stage_total = 0.0
+        for est in est_arr:
+            tree = est.tree_
+            for node in range(tree.node_count):
+                if tree.children_left[node] == _tree.TREE_LEAF:
+                    continue
+                fi    = tree.feature[node]
+                name  = feature_names[fi] if fi < len(feature_names) else f"f{fi}"
+                n_node = tree.n_node_samples[node]
+                n_l   = tree.n_node_samples[tree.children_left[node]]
+                n_r   = tree.n_node_samples[tree.children_right[node]]
+                imp_p = tree.impurity[node]
+                imp_l = tree.impurity[tree.children_left[node]]
+                imp_r = tree.impurity[tree.children_right[node]]
+                red   = imp_p - (n_l/n_node)*imp_l - (n_r/n_node)*imp_r
+                feat_gain[name]  = feat_gain.get(name, 0.0) + red
+                feat_count[name] = feat_count.get(name, 0)  + 1
+                stage_total += red
+        stage_gains.append(stage_total)
+
+    subsection("Decision Power Per Feature")
+    total_gain = sum(feat_gain.values()) + 1e-9
+    print(f"  {'Feature':<25} {'Splits':>7}  {'Total Gain':>12}  {'% Power':>9}  "
+          f"Avg gain/split")
+    print("  " + "─" * 68)
+    for name in sorted(feat_gain, key=feat_gain.get, reverse=True):
+        pct = feat_gain[name] / total_gain * 100
+        avg = feat_gain[name] / feat_count[name]
+        bar = "█" * int(pct * 0.4)
+        print(f"  {name:<25} {feat_count[name]:>7}  {feat_gain[name]:>12.4f}  "
+              f"{pct:>8.1f}%  {avg:>14.4f}  {bar}")
+
+    subsection("Stage-wise Decision Contribution (gain per boosting round)")
+    print("  Early rounds make large impurity reductions; later rounds fine-tune.\n")
+    max_g = max(stage_gains) if stage_gains else 1.0
+    step  = max(1, len(stage_gains)//10)
+    print(f"  {'Stage':>7}  {'Gain':>10}  Contribution bar")
+    print("  " + "─" * 50)
+    for i in range(0, len(stage_gains), step):
+        bar = "█" * int(stage_gains[i]/max_g*35)
+        print(f"  {i+1:>7}  {stage_gains[i]:>10.4f}  {bar}")
+
+
+def _explain_linear_decisions(model, feature_names, X_train, y_train, task_type):
+    """Decision explanations for linear models — how regularization shaped weights."""
+    is_clf = task_type == "classification"
+    coefs  = model.coef_.flatten() if model.coef_.ndim > 1 else model.coef_
+    model_name = type(model).__name__
+
+    section(f"Linear Model Decision Explanations  ({model_name})")
+    print(textwrap.fill(
+        "  A linear model learns by minimising a loss (+ regularization penalty). "
+        "The final weights reflect a balance between fitting training data and "
+        "staying small (regularization). Here we explain what shaped each weight.",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+    print()
+
+    subsection("Weight Interpretation — What Each Coefficient Means")
+    stds = X_train.std(axis=0) + 1e-9
+    standardised = np.abs(coefs) * stds  # impact in output units
+    total_impact = standardised.sum() + 1e-9
+
+    print(f"  {'Feature':<25} {'Weight':>10}  {'Std-Impact':>12}  "
+          f"{'% Decision':>11}  Why it matters")
+    print("  " + "─" * 80)
+    order = np.argsort(standardised)[::-1]
+    for rank, i in enumerate(order):
+        name   = feature_names[i]
+        w      = coefs[i]
+        impact = standardised[i]
+        pct    = impact / total_impact * 100
+        bar    = "█" * int(pct * 0.5)
+        dirn   = "↑ more → class 1" if (is_clf and w > 0) else                  "↓ more → class 0" if is_clf else                  "↑ increases output" if w > 0 else "↓ decreases output"
+        print(f"  {name:<25} {w:>10.4f}  {impact:>12.4f}  {pct:>10.1f}%  {dirn}  {bar}")
+
+    subsection("Regularization Effect")
+    alpha = getattr(model, "C", None) or getattr(model, "alpha", None)
+    penalty = getattr(model, "penalty", "l2")
+    if alpha is not None:
+        print(f"  Regularization parameter: {alpha}  (penalty: {penalty})")
+    n_zero = np.sum(np.abs(coefs) < 1e-6)
+    if n_zero > 0:
+        print(f"  {n_zero} weights are effectively zero → L1/ElasticNet forced sparsity")
+    max_w = np.max(np.abs(coefs))
+    min_w = np.min(np.abs(coefs))
+    ratio = max_w / (min_w + 1e-9)
+    print(f"  Max |weight|: {max_w:.4f}  Min |weight|: {min_w:.6f}  Ratio: {ratio:.1f}x")
+    if ratio > 100:
+        print(f"  🟡 High weight imbalance — one feature dominates decisions")
+    else:
+        print(f"  ✅ Weight magnitudes reasonably balanced")
+
+
+def training_decision_explanations(model, feature_names, X_train, y_train, task_type):
+    """Entry point — routes to the right explanation based on model type."""
+    banner("STEP 3.5 — TRAINING DECISION EXPLANATIONS")
+    model_name = type(model).__name__
+
+    section("What This Section Shows")
+    print(textwrap.fill(
+        "  Explains WHY the model made each split or assigned each weight. "
+        "For tree models: which feature gave the highest impurity reduction and why. "
+        "For linear models: how regularization shaped the final coefficients.",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+
+    if HAS_XGB and model_name in ("XGBClassifier", "XGBRegressor"):
+        _explain_xgb_decisions(model, feature_names, X_train, y_train)
+    elif model_name in ("DecisionTreeClassifier", "DecisionTreeRegressor"):
+        _explain_tree_decisions(model, feature_names, X_train, y_train, task_type)
+    elif model_name in ("RandomForestClassifier", "RandomForestRegressor"):
+        _explain_forest_decisions(model, feature_names, X_train, y_train, task_type)
+    elif model_name in ("GradientBoostingClassifier", "GradientBoostingRegressor"):
+        _explain_gbm_decisions(model, feature_names, X_train, y_train, task_type)
+    elif model_name in ("LinearRegression", "Ridge", "Lasso", "ElasticNet",
+                        "LogisticRegression", "SGDClassifier", "SGDRegressor"):
+        _explain_linear_decisions(model, feature_names, X_train, y_train, task_type)
+    elif HAS_LGB and model_name in ("LGBMClassifier", "LGBMRegressor"):
+        section("LightGBM Split Decisions")
+        try:
+            imp_split = model.booster_.feature_importance(importance_type="split")
+            imp_gain  = model.booster_.feature_importance(importance_type="gain")
+            total_g   = imp_gain.sum() + 1e-9
+            print(f"  {'Feature':<25} {'Splits':>8}  {'Total Gain':>12}  {'% Power':>9}")
+            print("  " + "─" * 60)
+            for name, s, g in sorted(
+                    zip(feature_names, imp_split, imp_gain),
+                    key=lambda x: x[2], reverse=True):
+                bar = "█" * int(g/total_g*40)
+                print(f"  {name:<25} {s:>8}  {g:>12.4f}  {g/total_g*100:>8.1f}%  {bar}")
+        except Exception as e:
+            print(f"  (unavailable: {e})")
+    else:
+        section("Decision Explanations")
+        print(f"  No dedicated explainer for {model_name}.")
+        print(f"  See Step 8 (Permutation Importance) for feature impact.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  STEP 4 — TRAINING (with live timing)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -595,6 +1216,270 @@ def evaluate_model(model, X_train_s, X_test_s, y_train, y_test, task_type):
             pct = abs(residual / y_test[i]) * 100 if y_test[i] != 0 else float("nan")
             print(f"  {i:<10} {y_test[i]:>12.4f} {y_pred_test[i]:>12.4f} "
                   f"{residual:>12.4f} {pct:>9.2f}%")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STEP 6.5 — OVERFITTING DIAGNOSIS ENGINE
+#  Combines train/test gap, learning curve signals, model complexity, and
+#  dataset size to produce an actionable diagnosis with specific fixes.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def overfitting_diagnosis(model, X_train, y_train, X_test, y_test,
+                           feature_names, task_type, health_issues=None):
+    banner("STEP 6.5 — OVERFITTING DIAGNOSIS ENGINE")
+
+    is_clf     = task_type == "classification"
+    model_name = type(model).__name__
+    n_train    = len(X_train)
+    n_test     = len(X_test)
+    n_features = X_train.shape[1]
+
+    # ── Compute scores ────────────────────────────────────────────────────────
+    if is_clf:
+        train_score = accuracy_score(y_train, model.predict(X_train))
+        test_score  = accuracy_score(y_test,  model.predict(X_test))
+        metric_name = "Accuracy"
+    else:
+        train_score = r2_score(y_train, model.predict(X_train))
+        test_score  = r2_score(y_test,  model.predict(X_test))
+        metric_name = "R²"
+
+    gap      = train_score - test_score
+    abs_gap  = abs(gap)
+
+    section("Train vs Test Gap Analysis")
+    bar_t = "█" * int(train_score * 40)
+    bar_e = "█" * int(max(test_score, 0) * 40)
+    print(f"  Train {metric_name}: {train_score:.4f}  {bar_t}")
+    print(f"  Test  {metric_name}: {test_score:.4f}  {bar_e}")
+    print(f"  Gap (train−test):  {gap:+.4f}")
+    print()
+
+    # ── Determine regime ──────────────────────────────────────────────────────
+    if train_score < 0.6 and test_score < 0.6:
+        regime = "UNDERFITTING"
+    elif abs_gap > 0.15:
+        regime = "OVERFITTING"
+    elif abs_gap > 0.05:
+        regime = "MILD_OVERFIT"
+    elif gap < -0.02:
+        regime = "SUSPICIOUS"
+    else:
+        regime = "HEALTHY"
+
+    regime_display = {
+        "OVERFITTING":  "🔴 OVERFITTING DETECTED",
+        "MILD_OVERFIT": "🟡 MILD OVERFITTING",
+        "UNDERFITTING": "🔴 UNDERFITTING DETECTED",
+        "SUSPICIOUS":   "🟡 SUSPICIOUS (test > train)",
+        "HEALTHY":      "✅ HEALTHY FIT",
+    }
+    print(f"  Diagnosis: {regime_display[regime]}")
+
+    # ── Causal analysis ───────────────────────────────────────────────────────
+    section("Causal Analysis — Why This Might Be Happening")
+
+    causes   = []
+    fixes    = []
+
+    # Model complexity signals
+    if model_name in ("RandomForestClassifier", "RandomForestRegressor"):
+        n_est   = model.n_estimators
+        max_d   = model.max_depth
+        depths  = [e.tree_.max_depth for e in model.estimators_]
+        avg_d   = np.mean(depths)
+        max_d_a = max(depths)
+        print(f"  Model:          RandomForest  ({n_est} trees, avg depth={avg_d:.1f}, max={max_d_a})")
+        if avg_d > 15 and regime in ("OVERFITTING", "MILD_OVERFIT"):
+            causes.append(f"Very deep trees (avg depth={avg_d:.1f}) — memorising training noise")
+            fixes.append("Set max_depth=5-10, increase min_samples_leaf")
+        if n_est > 500 and regime in ("OVERFITTING", "MILD_OVERFIT"):
+            causes.append(f"Large forest ({n_est} trees) adds little and may overfit noise")
+            fixes.append("Try n_estimators=100-200")
+
+    elif model_name in ("GradientBoostingClassifier", "GradientBoostingRegressor"):
+        n_est = model.n_estimators
+        lr    = model.learning_rate
+        md    = model.max_depth
+        print(f"  Model:          GradientBoosting  ({n_est} trees, lr={lr}, depth={md})")
+        if n_est > 200 and regime in ("OVERFITTING", "MILD_OVERFIT"):
+            causes.append(f"Too many boosting rounds ({n_est}) — model has memorised training set")
+            fixes.append("Reduce n_estimators (use early stopping to find optimum)")
+        if lr > 0.2 and regime in ("OVERFITTING", "MILD_OVERFIT"):
+            causes.append(f"High learning rate ({lr}) — each tree overcorrects")
+            fixes.append("Reduce learning_rate to 0.01-0.1, increase n_estimators accordingly")
+        if md > 4:
+            causes.append(f"Deep trees (depth={md}) can memorise individual samples")
+            fixes.append("Use max_depth=2-4 for GBM — shallow trees are standard")
+
+    elif HAS_XGB and model_name in ("XGBClassifier", "XGBRegressor"):
+        n_est = getattr(model, "n_estimators", "?")
+        lr    = model.get_params().get("learning_rate", 0.3)
+        md    = model.get_params().get("max_depth", 6)
+        print(f"  Model:          XGBoost  ({n_est} trees, lr={lr}, depth={md})")
+        if regime in ("OVERFITTING", "MILD_OVERFIT"):
+            if md and md > 6:
+                causes.append(f"max_depth={md} is high for XGBoost — try 3-6")
+                fixes.append("Set max_depth=3-6")
+            if lr and lr > 0.2:
+                causes.append(f"High learning rate ({lr})")
+                fixes.append("Lower learning_rate to 0.01-0.1")
+            causes.append("No regularization set (gamma, reg_alpha, reg_lambda)")
+            fixes.append("Add gamma=0.1, reg_alpha=0.1, reg_lambda=1.0")
+
+    elif model_name in ("DecisionTreeClassifier", "DecisionTreeRegressor"):
+        md = model.tree_.max_depth
+        nl = int(np.sum(model.tree_.children_left == -1))
+        print(f"  Model:          DecisionTree  (depth={md}, leaves={nl})")
+        if md > 5 and regime in ("OVERFITTING", "MILD_OVERFIT"):
+            causes.append(f"Unconstrained tree depth ({md}) — likely memorised training data")
+            fixes.append("Set max_depth=3-5, min_samples_leaf=5-10")
+        if nl > n_train // 3:
+            causes.append(f"Too many leaves ({nl}) relative to training size ({n_train})")
+            fixes.append("Use ccp_alpha for post-pruning or limit max_leaf_nodes")
+
+    elif model_name in ("SVC", "SVR"):
+        C = model.C
+        print(f"  Model:          SVM  (C={C}, kernel={model.kernel})")
+        if C > 10 and regime in ("OVERFITTING", "MILD_OVERFIT"):
+            causes.append(f"High C={C} — SVM is fitting training noise")
+            fixes.append("Reduce C (try C=0.1-1.0)")
+
+    elif model_name in ("KNeighborsClassifier", "KNeighborsRegressor"):
+        k = model.n_neighbors
+        print(f"  Model:          KNN  (k={k})")
+        if k == 1 and regime in ("OVERFITTING", "MILD_OVERFIT"):
+            causes.append("k=1 means each test point is classified by one neighbour — extremely noisy")
+            fixes.append("Increase k (try k=5-15)")
+        if k < 3:
+            causes.append(f"Very small k={k} is sensitive to individual training points")
+            fixes.append("Use k=5+ for smoother decision boundaries")
+
+    elif model_name in ("LinearRegression", "Ridge", "Lasso", "ElasticNet",
+                        "LogisticRegression"):
+        print(f"  Model:          {model_name}")
+        if model_name == "LinearRegression" and regime in ("OVERFITTING", "MILD_OVERFIT"):
+            causes.append("LinearRegression has no regularization — can overfit with many features")
+            fixes.append("Switch to Ridge or Lasso for built-in regularization")
+
+    # Data-side causes
+    print()
+    samples_per_feat = n_train / n_features
+    if samples_per_feat < 10 and regime in ("OVERFITTING", "MILD_OVERFIT"):
+        causes.append(f"Low samples/feature ratio ({samples_per_feat:.1f}) — "
+                      f"model has too much capacity for this data size")
+        fixes.append("Collect more data, reduce number of features, or use stronger regularization")
+
+    if n_test < 20 and regime in ("OVERFITTING", "MILD_OVERFIT", "SUSPICIOUS"):
+        causes.append(f"Test set is very small ({n_test} samples) — gap may be statistical noise")
+        fixes.append("Use cross-validation instead of a single train/test split")
+
+    # Feature correlation causes
+    if health_issues:
+        corr_issues = [i for i in health_issues if "correlated" in i[1].lower()]
+        if corr_issues and regime in ("OVERFITTING", "MILD_OVERFIT"):
+            causes.append("Highly correlated features can amplify overfitting in some models")
+            fixes.append("Remove redundant features or use PCA")
+
+    # Print causes and fixes
+    if regime == "HEALTHY":
+        print(f"  ✅ No significant overfitting or underfitting detected.")
+        print(f"     Train {metric_name} = {train_score:.4f}  |  "
+              f"Test {metric_name} = {test_score:.4f}  |  Gap = {gap:+.4f}")
+    elif regime == "UNDERFITTING":
+        print(f"  The model is too simple to capture the patterns in this data. ")
+        print(f"  Possible causes:")
+        under_causes = ["Model has insufficient complexity for this problem",
+                        "Features may not contain enough predictive signal",
+                        "Data may need better preprocessing / feature engineering"]
+        under_fixes  = ["Use a more complex model (e.g. GBM, RandomForest instead of LinearModel)",
+                        "Add interaction features or polynomial features",
+                        "Check if target is noisy or mislabelled"]
+        for c in under_causes:
+            print(f"    • {c}")
+        print(f" Recommended fixes:")
+        for f_ in under_fixes:
+            print(f"    → {f_}")
+    else:
+        if causes:
+            print(f"  Possible causes: ")
+            for c in causes:
+                print(f"    • {c}")
+        else:
+            print(f"  General causes for {regime}: ")
+            print(f"    • Model complexity too high relative to training data")
+            print(f"    • Insufficient training data")
+            print(f"    • Noisy features introducing spurious patterns")
+
+        if fixes:
+            print(f" Recommended fixes: ")
+            for f_ in fixes:
+                print(f"    → {f_}")
+
+        if regime == "SUSPICIOUS":
+            print(f" Test > Train often means:")
+            print(f"    • Lucky test split (small test set)")
+            print(f"    • Training set is harder than test set by chance")
+            print(f"    • Use cross-validation to get a reliable estimate")
+
+    # ── Mini learning curve ───────────────────────────────────────────────────
+    section("Mini Learning Curve — How Score Grows With More Data")
+    print(textwrap.fill(
+        "  Trains the model on increasing fractions of training data. "
+        "Converging train/test lines = healthy. Persistent large gap = overfitting. "
+        "Both lines low = underfitting.",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+    print()
+
+    fractions = [0.2, 0.4, 0.6, 0.8, 1.0]
+    import copy
+    print(f"  {'Frac':>6}  {'N':>5}  {'Train':>8}  {'Test':>8}  "
+          f"{'Gap':>8}  Fit bar (train=█  test=░)")
+    print("  " + "─" * 65)
+
+    for frac in fractions:
+        n_use = max(int(n_train * frac), min(5, n_train))
+        idx   = np.random.default_rng(42).choice(n_train, n_use, replace=False)
+        X_sub = X_train[idx]
+        y_sub = y_train[idx]
+        try:
+            m_copy = copy.deepcopy(model)
+            m_copy.fit(X_sub, y_sub)
+            if is_clf:
+                tr_s = accuracy_score(y_sub,   m_copy.predict(X_sub))
+                te_s = accuracy_score(y_test,  m_copy.predict(X_test))
+            else:
+                tr_s = r2_score(y_sub,  m_copy.predict(X_sub))
+                te_s = r2_score(y_test, m_copy.predict(X_test))
+            g_    = tr_s - te_s
+            bar_tr = "█" * int(max(tr_s, 0) * 20)
+            bar_te = "░" * int(max(te_s, 0) * 20)
+            print(f"  {frac:>6.0%}  {n_use:>5}  {tr_s:>8.4f}  {te_s:>8.4f}  "
+                  f"{g_:>+8.4f}  {bar_tr}{bar_te}")
+        except Exception as e:
+            print(f"  {frac:>6.0%}  {n_use:>5}  (skipped: {e})")
+
+    # ── Complexity vs performance summary ────────────────────────────────────
+    section("Complexity vs Performance Summary")
+    print(f"  Model complexity proxies:")
+
+    if hasattr(model, "n_estimators"):
+        print(f"    Estimators:      {model.n_estimators}")
+    if hasattr(model, "tree_") and hasattr(model.tree_, "max_depth"):
+        print(f"    Tree depth:      {model.tree_.max_depth}")
+    if hasattr(model, "estimators_") and hasattr(model.estimators_[0], "tree_"):
+        depths = [e.tree_.max_depth for e in model.estimators_]
+        print(f"    Avg tree depth:  {np.mean(depths):.1f}  (max={max(depths)})")
+    if hasattr(model, "coef_"):
+        coefs = model.coef_.flatten()
+        print(f"    Non-zero coefs:  {np.sum(np.abs(coefs) > 1e-6)} / {len(coefs)}")
+        print(f"    ||w|| L2:        {np.linalg.norm(coefs):.4f}")
+    if hasattr(model, "support_vectors_"):
+        print(f"    Support vectors: {len(model.support_vectors_)}"
+              f"  ({len(model.support_vectors_)/n_train*100:.1f}% of train)")
+
+    print(f" Rule of thumb: a well-fitted model has train≈test, "
+          f"both at a level that reflects the true signal in the data.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2429,6 +3314,9 @@ def run_pipeline(model, X, y, feature_names=None, task_type=None,
     print(f"  LightGBM: {'available' if HAS_LGB else 'not installed'}")
     print(f"  Optuna  : {'available' if HAS_OPTUNA else 'not installed  →  pip install optuna'}")
 
+    # 0. Dataset health report
+    health_issues = dataset_health_report(X, y, feature_names, task_type)
+
     # 1. Data analysis
     analyze_data(X, y, feature_names, task_type)
 
@@ -2440,6 +3328,9 @@ def run_pipeline(model, X, y, feature_names=None, task_type=None,
     # 3. Train
     model, elapsed = train_model(model, X_train_s, y_train)
 
+    # 3.5. Training decision explanations
+    training_decision_explanations(model, feature_names, X_train_s, y_train, task_type)
+
     # 4. Internals
     explain_model(model, feature_names, task_type)
 
@@ -2448,6 +3339,10 @@ def run_pipeline(model, X, y, feature_names=None, task_type=None,
 
     # 6. Metrics
     evaluate_model(model, X_train_s, X_test_s, y_train, y_test, task_type)
+
+    # 6.5. Overfitting diagnosis
+    overfitting_diagnosis(model, X_train_s, y_train, X_test_s, y_test,
+                          feature_names, task_type, health_issues=health_issues)
 
     # 7. Smart validation
     validate_model(model, X, y, X_train_s, y_train, X_test_s, y_test,
