@@ -83,6 +83,8 @@ def nlp_dataset_health(loader, tokenizer=None, class_names=None,
             ids, lbls = batch, None
         if HAS_TORCH and isinstance(ids, torch.Tensor):
             ids = ids.cpu().numpy()
+        elif not isinstance(ids, np.ndarray):
+            ids = np.array(ids)
         ids_all.append(ids)
         if lbls is not None:
             if HAS_TORCH and isinstance(lbls, torch.Tensor):
@@ -580,34 +582,37 @@ class NLPTrainingTracer:
     Usage:
         tracer = NLPTrainingTracer()
         for epoch in range(epochs):
-            ...
+            train_loss, train_acc, grad_norm = train_one_epoch(...)
+            val_loss,   val_acc              = validate(...)
             tracer.record(epoch, train_loss, train_acc, val_loss, val_acc,
-                          model=model, optimizer=optimizer, perplexity=ppl)
+                          optimizer=optimizer, grad_norm=grad_norm)
         # Pass tracer to run_nlp_pipeline
+
+    Why grad_norm is passed explicitly rather than read from model.parameters():
+        optimizer.zero_grad() is called inside the training loop after every
+        optimizer.step(), so by the time record() is called at epoch-end all
+        .grad tensors are zero.  The norm must be captured INSIDE the training
+        loop right after loss.backward() and clip_grad_norm_(), then returned
+        and passed here as grad_norm=.
     """
     def __init__(self):
         self.history = []
 
     def record(self, epoch, train_loss, train_acc=None,
                val_loss=None, val_acc=None,
-               model=None, optimizer=None, perplexity=None):
+               optimizer=None, grad_norm=None, perplexity=None):
         rec = {
             "epoch":      epoch+1,
             "train_loss": float(train_loss),
-            "train_acc":  float(train_acc) if train_acc is not None else None,
-            "val_loss":   float(val_loss)  if val_loss  is not None else None,
-            "val_acc":    float(val_acc)   if val_acc   is not None else None,
+            "train_acc":  float(train_acc)  if train_acc  is not None else None,
+            "val_loss":   float(val_loss)   if val_loss   is not None else None,
+            "val_acc":    float(val_acc)    if val_acc    is not None else None,
             "ppl":        float(perplexity) if perplexity is not None else None,
-            "lr":         None, "grad_norm": None,
+            "lr":         None,
+            "grad_norm":  float(grad_norm)  if grad_norm  is not None else None,
         }
         if optimizer and HAS_TORCH:
             rec["lr"] = optimizer.param_groups[0]["lr"]
-        if model and HAS_TORCH:
-            gn = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    gn += p.grad.data.norm(2).item()**2
-            rec["grad_norm"] = gn**0.5
         self.history.append(rec)
 
     def report(self):
@@ -1187,7 +1192,7 @@ def nlp_evaluation_metrics(model, val_loader, class_names=None, task="classifica
             cn = (class_names[ci][:14] if class_names and ci<len(class_names)
                   else f"Class {ci}")[:14]
             row = "  ".join(f"{cm[i,j]:>5}" for j in range(n_cls))
-            flag = "✅" if cm[i,i]==cm[i].sum()>0 else "❌" if cm[i,i]==0 else "  "
+            flag = "✅" if (cm[i,i]>0 and cm[i,i]==cm[i].sum()) else "❌" if cm[i,i]==0 else "  "
             print(f"  {cn:<16} │ {row} │ {flag}")
     else:
         diag = np.diag(cm)/(cm.sum(axis=1)+1e-9)
@@ -1232,9 +1237,8 @@ def nlp_overfitting_diagnosis(model, train_loader, val_loader,
     banner("STEP 8 — OVERFITTING DIAGNOSIS ENGINE")
     if not HAS_TORCH: print("  PyTorch required"); return
 
-    device = next(model.parameters()).device
-    total_p,_ = sum(p.numel() for p in model.parameters()), None
-    total_p    = sum(p.numel() for p in model.parameters())
+    device  = next(model.parameters()).device
+    total_p = sum(p.numel() for p in model.parameters())
     try:
         n_train = len(train_loader.dataset)
         n_val   = len(val_loader.dataset)
@@ -1474,6 +1478,7 @@ def token_attribution(model, sample_batch, tokenizer=None,
         # We need to hook the embedding and re-route forward
         emb_out_store = {}
         def emb_hook(mod, inp, out):
+            out.retain_grad()          # ensure grad flows back to this tensor
             emb_out_store['emb'] = out
         hndl = emb_module.register_forward_hook(emb_hook)
 

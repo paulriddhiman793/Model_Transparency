@@ -283,8 +283,6 @@ class SentimentLSTM(nn.Module):
     def forward(self, x):
         # x: (B, T)
         emb    = self.emb_drop(self.embedding(x))           # (B, T, D)
-        # Compute actual lengths for smarter pooling
-        lens   = (x != 0).sum(dim=1).clamp(min=1)          # (B,)
         out, (hn, _) = self.lstm(emb)                       # out:(B,T,2H)
         # Use last real hidden state (not padding)
         # hn: (num_layers*2, B, H)
@@ -376,6 +374,10 @@ def train_one_epoch(model, loader, optimizer, criterion, device,
                     grad_clip=1.0, grad_accum=1):
     model.train()
     total_loss = total_correct = total = 0
+    # Accumulate squared gradient norms across all optimizer steps this epoch
+    # so we can report the mean pre-clip norm to the tracer.
+    sum_sq_norm = 0.0
+    n_opt_steps = 0
     optimizer.zero_grad()
     for step, (ids, lbls) in enumerate(loader):
         ids  = ids.to(device)
@@ -384,13 +386,22 @@ def train_one_epoch(model, loader, optimizer, criterion, device,
         loss = criterion(out, lbls) / grad_accum
         loss.backward()
         if (step+1) % grad_accum == 0:
+            # ── Capture norm AFTER backward, BEFORE clip+zero ─────────────────
+            raw_sq = sum(
+                p.grad.data.norm(2).item()**2
+                for p in model.parameters() if p.grad is not None
+            )
+            sum_sq_norm += raw_sq
+            n_opt_steps += 1
+            # ─────────────────────────────────────────────────────────────────
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
             optimizer.zero_grad()
         total_loss    += loss.item() * grad_accum * len(lbls)
         total_correct += (out.argmax(dim=1)==lbls).sum().item()
         total         += len(lbls)
-    return total_loss/total, total_correct/total
+    mean_grad_norm = (sum_sq_norm / max(n_opt_steps, 1)) ** 0.5
+    return total_loss/total, total_correct/total, mean_grad_norm
 
 
 def validate(model, loader, criterion, device):
@@ -420,7 +431,7 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler,
 
     for epoch in range(epochs):
         t0 = time.time()
-        tl, ta = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        tl, ta, grad_norm = train_one_epoch(model, train_loader, optimizer, criterion, device)
         vl, va = validate(model, val_loader, criterion, device)
 
         if scheduler is not None:
@@ -430,7 +441,8 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler,
                 scheduler.step()
 
         lr = optimizer.param_groups[0]["lr"]
-        tracer.record(epoch, tl, ta, vl, va, model=model, optimizer=optimizer)
+        tracer.record(epoch, tl, ta, vl, va,
+                      optimizer=optimizer, grad_norm=grad_norm)
 
         flag = " ⚠" if ta-va > 0.15 else " ★" if va > best_val_acc else "  "
         print(f"  {epoch+1:>7}  {tl:>12.4f}  {ta:>10.4f}  "
