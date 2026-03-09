@@ -1,52 +1,159 @@
-from model_transparency import run_pipeline
-from xgboost import XGBClassifier
+"""
+Housing Price Prediction Pipeline
+==================================
+Dataset : housing.csv  (California Housing, ~20,640 rows)
+
+          Columns:
+            longitude, latitude, housing_median_age, total_rooms,
+            total_bedrooms, population, households, median_income,
+            median_house_value   <- regression target  (auto-detected)
+            ocean_proximity      <- categorical string  (triggers CatBoost auto-swap)
+
+  The pipeline infers the target column automatically using name-pattern +
+  heuristics — no hard-coded y= needed. "median_house_value" scores a strong
+  match on the "value" keyword + float dtype + high cardinality.
+
+Usage:
+    python housing_pipeline.py --data /path/to/housing.csv
+    python housing_pipeline.py --data ~/repos/my-repo/data/housing.csv
+    python housing_pipeline.py --data https://raw.githubusercontent.com/.../housing.csv
+    python housing_pipeline.py --data /path/to/housing.csv --sample 3000
+    python housing_pipeline.py --data /path/to/housing.csv --raw
+"""
+
+import argparse
+import os
+import sys
 import numpy as np
+import pandas as pd
 
-# Small dataset: predict if a student passes (1) or fails (0)
-# Features: [hours_studied, attendance_%, prev_score, assignments_done]
-X = np.array([
-    [1.0, 40, 35, 2],
-    [2.0, 55, 50, 3],
-    [1.5, 45, 40, 2],
-    [3.0, 70, 60, 5],
-    [4.0, 80, 72, 6],
-    [5.0, 85, 78, 7],
-    [6.0, 90, 85, 8],
-    [7.0, 92, 88, 9],
-    [5.5, 88, 80, 8],
-    [2.5, 60, 55, 4],
-    [3.5, 75, 65, 6],
-    [1.0, 38, 30, 1],
-    [4.5, 82, 74, 7],
-    [6.5, 91, 87, 9],
-    [2.0, 50, 45, 3],
-    [3.0, 68, 58, 5],
-    [7.0, 95, 92, 10],
-    [1.5, 42, 38, 2],
-    [5.0, 84, 76, 7],
-    [4.0, 78, 68, 6],
-])
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURE YOUR PATH HERE  (or pass --data at the command line)
+# ═══════════════════════════════════════════════════════════════════════════════
+DEFAULT_DATA_PATH = "D:\\Downloads\\Agents\\Model_Transparency\\Housing.csv"   # <-- change this to your path
+# ═══════════════════════════════════════════════════════════════════════════════
 
-y = np.array([0, 0, 0, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 1, 0, 1, 1])
-
-feature_names = ["hours_studied", "attendance_pct", "prev_score", "assignments_done"]
-
-model = XGBClassifier(
-    n_estimators=50,
-    max_depth=3,
-    learning_rate=0.1,
-    use_label_encoder=False,
-    eval_metric="logloss",
-    random_state=42
+# ── CLI args ───────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="Housing price prediction pipeline")
+parser.add_argument(
+    "--data", type=str, default=None,
+    help=(
+        "Path or URL to housing.csv.  Examples:\n"
+        "  --data /home/user/datasets/housing.csv\n"
+        "  --data ~/repos/my-repo/data/housing.csv\n"
+        "  --data https://raw.githubusercontent.com/you/repo/main/housing.csv"
+    )
 )
+parser.add_argument(
+    "--raw", action="store_true",
+    help="Skip feature engineering — use the raw columns only"
+)
+parser.add_argument(
+    "--sample", type=int, default=None,
+    help="Use a random sample of N rows (default: all ~20,640)"
+)
+args = parser.parse_args()
 
-run_pipeline(
+# ── Resolve data path ──────────────────────────────────────────────────────────
+data_path = args.data or DEFAULT_DATA_PATH
+
+print("\n" + "=" * 70)
+print("  California Housing — ML Transparency Pipeline")
+print("=" * 70 + "\n")
+print(f"  Data path : {data_path}")
+
+# ── Load data ──────────────────────────────────────────────────────────────────
+print("  Loading ...")
+try:
+    df = pd.read_csv(data_path)
+    print(f"  Loaded: {len(df):,} rows x {df.shape[1]} columns")
+except FileNotFoundError:
+    print(f"\n  ERROR: File not found — '{data_path}'")
+    print(f"  Set DEFAULT_DATA_PATH at the top of this script, or pass --data <path>")
+    sys.exit(1)
+except Exception as e:
+    print(f"\n  ERROR loading data: {e}")
+    sys.exit(1)
+
+# ── Impute missing values ──────────────────────────────────────────────────────
+nan_counts = df.isnull().sum()
+if nan_counts.any():
+    print(f"\n  Missing values detected:")
+    for col, n in nan_counts[nan_counts > 0].items():
+        median_val = df[col].median()
+        df[col]    = df[col].fillna(median_val)
+        print(f"    {col:<30}: {n} NaN  -> imputed with median ({median_val:.2f})")
+
+# ── Optional row sampling ──────────────────────────────────────────────────────
+if args.sample and args.sample < len(df):
+    df = df.sample(n=args.sample, random_state=42).reset_index(drop=True)
+    print(f"\n  Sampled {len(df):,} rows  (--sample {args.sample})")
+
+# ── Feature engineering ────────────────────────────────────────────────────────
+if not args.raw and {"total_rooms", "total_bedrooms", "population", "households"}.issubset(df.columns):
+    print("\n  Applying feature engineering ...")
+    df["rooms_per_household"]      = df["total_rooms"]    / df["households"]
+    df["bedrooms_per_room"]        = df["total_bedrooms"] / df["total_rooms"]
+    df["population_per_household"] = df["population"]     / df["households"]
+    df = df.drop(columns=["total_rooms", "total_bedrooms", "population"])
+    print("    Added   : rooms_per_household, bedrooms_per_room, population_per_household")
+    print("    Dropped : total_rooms, total_bedrooms, population  (replaced by ratios)")
+
+# ── Model ──────────────────────────────────────────────────────────────────────
+# XGBRegressor is used by default.
+# run_pipeline_from_df will auto-swap to CatBoostRegressor if catboost is
+# installed, because ocean_proximity is a string categorical column.
+
+try:
+    from xgboost import XGBRegressor
+    model = XGBRegressor(
+        n_estimators     = 300,
+        max_depth        = 5,
+        learning_rate    = 0.05,
+        subsample        = 0.8,
+        colsample_bytree = 0.8,
+        reg_alpha        = 0.1,
+        reg_lambda       = 1.0,
+        random_state     = 42,
+        n_jobs           = -1,
+        verbosity        = 0,
+    )
+    print(f"\n  Supplied model : XGBRegressor")
+except ImportError:
+    from sklearn.ensemble import GradientBoostingRegressor
+    model = GradientBoostingRegressor(
+        n_estimators=200, max_depth=4, learning_rate=0.05,
+        subsample=0.8, random_state=42,
+    )
+    print(f"\n  XGBoost not found — using GradientBoostingRegressor as fallback.")
+    print(f"  Install with:  pip install xgboost")
+
+print(f"  CatBoost auto-swap active if catboost is installed  (pip install catboost)\n")
+
+# ── Import pipeline ────────────────────────────────────────────────────────────
+try:
+    from model_transparency import run_pipeline_from_df
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from model_transparency import run_pipeline_from_df
+
+# ── Run — pass the whole DataFrame, target is auto-detected ───────────────────
+#
+#   run_pipeline_from_df() will:
+#     1. Score every column with name-pattern + heuristics
+#     2. Select "median_house_value"  (strong "value" keyword match + float dtype)
+#     3. Print a full inference report showing scores for all columns
+#     4. Split df into X and y, then run the full transparency pipeline
+#
+#   To override the inferred target explicitly:
+#     run_pipeline_from_df(model, df, target_col="median_house_value", ...)
+
+run_pipeline_from_df(
     model,
-    X, y,
-    feature_names=feature_names,
-    task_type="classification",
-    test_size=0.25,
-    scale=False,       # XGBoost handles raw features fine
-    cv=3,              # small cv since dataset is small
-    n_walkthrough=3
+    df,                       # full DataFrame — no manual X/y split needed
+    task_type     = "regression",
+    test_size     = 0.20,
+    scale         = True,     # auto-disabled if CatBoost is swapped in
+    cv            = 5,
+    n_walkthrough = 4,
 )

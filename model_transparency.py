@@ -5,6 +5,8 @@
   Supports: Linear/Logistic Regression, Ridge, Lasso, Decision Tree,
             Random Forest, Gradient Boosting, SVM, KNN, + XGBoost/LightGBM
             (auto-detected if installed)
+  CatBoost: Auto-selected when categorical columns are detected
+            (pip install catboost to enable)
   Task types: Classification & Regression
   Output: Terminal only — rich, step-by-step internals
 ==============================================================================
@@ -32,6 +34,12 @@ try:
     HAS_LGB = True
 except ImportError:
     HAS_LGB = False
+
+try:
+    from catboost import CatBoostClassifier, CatBoostRegressor, Pool
+    HAS_CB = True
+except ImportError:
+    HAS_CB = False
 
 try:
     import optuna
@@ -115,6 +123,45 @@ def progress_bar(current, total, label="", width=40):
     if current == total:
         print()
 
+
+# ── Mixed-dtype helpers ───────────────────────────────────────────────────────
+# X may be a numpy object array when categorical string columns are present
+# (e.g. ocean_proximity).  These helpers let every downstream step work safely.
+
+def _to_float_col(X, i):
+    """Return column i of X as float64, or None if it contains strings."""
+    col = X[:, i] if isinstance(X, np.ndarray) else np.asarray(X.iloc[:, i])
+    try:
+        return col.astype(np.float64)
+    except (ValueError, TypeError):
+        return None
+
+def _is_numeric_col(X, i):
+    """True if column i can be safely cast to float64."""
+    return _to_float_col(X, i) is not None
+
+def _numeric_X(X, feature_names):
+    """Return (X_num float64, numeric_names, categorical_names)."""
+    num_cols, num_names, cat_names = [], [], []
+    for i, name in enumerate(feature_names):
+        col = _to_float_col(X, i)
+        if col is not None:
+            num_cols.append(col)
+            num_names.append(name)
+        else:
+            cat_names.append(name)
+    X_num = np.column_stack(num_cols) if num_cols else np.empty((X.shape[0], 0), dtype=np.float64)
+    return X_num, num_names, cat_names
+
+
+def _fmt_val(val, decimals=4):
+    """Format a feature value safely — numbers get :.Nf, strings print as-is."""
+    try:
+        return f"{float(val):.{decimals}f}"
+    except (ValueError, TypeError):
+        return str(val)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  STEP 1 — DATA ANALYSIS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -125,6 +172,298 @@ def progress_bar(current, total, label="", width=40):
 #  corrupt every downstream result if not caught here.
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  TARGET COLUMN INFERENCE
+#  Automatically detects which column in a DataFrame is the prediction target.
+#  Uses name-pattern matching + heuristics so you never have to hard-code y.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Target keyword lists — split by match strength so we can award different scores
+# STRONG: unambiguous target names (exact or as a whole word in the column name)
+_TARGET_STRONG = {
+    "target", "label", "class", "output", "response", "outcome",
+    "dependent", "y",
+    "churn", "fraud", "default", "survived", "survival",
+    "diagnosis", "disease", "spam", "click", "conversion",
+    "price", "value", "cost", "revenue", "salary", "wage",
+    "fare", "sales", "profit", "loss", "score", "rating",
+    "grade", "rank", "quality", "demand", "yield",
+    "temperature", "risk", "probability", "pred", "result",
+}
+# WEAK: words that appear legitimately in feature names too (e.g. "income" in
+# "median_income" which is a feature, not the target in many datasets)
+_TARGET_WEAK = {"income", "charge", "amount", "energy", "consumption",
+                "load", "category", "result"}
+
+# Columns whose names suggest they are identifiers, not targets
+_ID_TOKENS = {"id", "index", "rownum", "row_num", "serial",
+              "uuid", "guid", "key", "pk", "record", "no", "num"}
+
+
+def _col_tokens(col_name):
+    """Split a column name on underscores, hyphens and spaces → lowercase tokens."""
+    import re
+    return set(re.split(r"[_\-\s]+", col_name.lower().strip()))
+
+
+def infer_target_column(df, verbose=True):
+    """
+    Infer which column of a DataFrame is the prediction target.
+
+    Strategy (rules applied in priority order, highest wins):
+    ──────────────────────────────────────────────────────────
+    1. EXACT match       — col name IS a strong target keyword         +120
+    2. WORD match        — col name CONTAINS a strong keyword as a
+                           whole token (split on _ - space)            + 80
+    3. WEAK word match   — col name contains a weak target keyword     + 40
+    4. LAST COLUMN       — position bonus (many datasets end with y)   + 15
+    5. CARDINALITY
+         binary (2 unique)                                             + 25
+         low-card int/float (3–10)                                     + 18
+         moderate-card (11–20)                                         + 8
+         very wide float range (std/mean > 1 — suggests dollar amount) + 12
+         near-unique integer (likely ID)                               - 25
+    6. DTYPE
+         bool                                                          + 12
+         float                                                         +  5
+         int                                                           +  3
+         object/string                                                 -  8
+    7. ID SUPPRESSION    — any token in column name is an ID token     → -999
+
+    Returns
+    ───────
+    target_col : str   — inferred column name
+    confidence : str   — "HIGH" / "MEDIUM" / "LOW"
+    reason     : str   — human-readable explanation
+    scores     : dict  — {col: float score} for all columns
+    """
+    if not isinstance(df, pd.DataFrame):
+        return None, "NONE", "Input is not a DataFrame", {}
+
+    cols = list(df.columns)
+    n    = len(df)
+
+    if len(cols) == 0:
+        return None, "NONE", "DataFrame has no columns", {}
+    if len(cols) == 1:
+        return cols[0], "HIGH", "Only one column — must be target", {cols[0]: 1.0}
+
+    scores  = {}
+    reasons = {}
+
+    for i, col in enumerate(cols):
+        col_lower  = col.lower().strip()
+        tokens     = _col_tokens(col)
+
+        # ── ID suppression ─────────────────────────────────────────────────────
+        # Suppress if ANY token is a pure ID word, OR the whole name is e.g. "id"
+        if tokens & _ID_TOKENS or col_lower in _ID_TOKENS:
+            scores[col]  = -999.0
+            reasons[col] = f"suppressed — '{col}' contains an ID-like token"
+            continue
+
+        score = 0.0
+        rsn   = []
+        series = df[col]
+
+        # ── 1 & 2: Name matching ───────────────────────────────────────────────
+        if col_lower in _TARGET_STRONG:
+            score += 120.0
+            rsn.append(f"exact strong match ('{col}')")
+        elif tokens & _TARGET_STRONG:
+            matched = tokens & _TARGET_STRONG
+            score += 80.0
+            rsn.append(f"word match: {matched}")
+        elif tokens & _TARGET_WEAK:
+            matched = tokens & _TARGET_WEAK
+            score += 40.0
+            rsn.append(f"weak word match: {matched}")
+
+        # ── 3: Last column bonus ───────────────────────────────────────────────
+        if i == len(cols) - 1:
+            score += 15.0
+            rsn.append("last column")
+
+        # ── 4: Cardinality ─────────────────────────────────────────────────────
+        try:
+            n_unique  = series.nunique()
+            ratio     = n_unique / max(n, 1)
+            dtype_str = str(series.dtype)
+
+            if n_unique <= 2:
+                score += 25.0
+                rsn.append(f"binary ({n_unique} unique)")
+            elif n_unique <= 10:
+                score += 18.0
+                rsn.append(f"low cardinality ({n_unique} unique)")
+            elif n_unique <= 20:
+                score += 8.0
+                rsn.append(f"moderate cardinality ({n_unique} unique)")
+            elif ratio > 0.9 and dtype_str.startswith("int"):
+                score -= 25.0
+                rsn.append("near-unique int (likely ID)")
+
+            # Wide-range float bonus: large std relative to mean → dollar/price col
+            if dtype_str.startswith("float") and n_unique > 20:
+                try:
+                    mean_abs = abs(series.mean())
+                    std      = series.std()
+                    if mean_abs > 0 and (std / mean_abs) > 0.3:
+                        score += 12.0
+                        rsn.append(f"wide-range float (std/mean={std/mean_abs:.2f})")
+                except Exception:
+                    pass
+
+        except Exception:
+            pass
+
+        # ── 5: dtype ───────────────────────────────────────────────────────────
+        dtype_str = str(series.dtype)
+        if dtype_str == "bool":
+            score += 12.0
+            rsn.append("bool")
+        elif dtype_str.startswith("float"):
+            score += 5.0
+            rsn.append("float")
+        elif dtype_str.startswith("int"):
+            score += 3.0
+            rsn.append("int")
+        elif dtype_str == "object":
+            score -= 8.0
+            rsn.append("string (penalised)")
+
+        scores[col]  = score
+        reasons[col] = ", ".join(rsn) if rsn else "no strong signal"
+
+    # ── Pick winner ────────────────────────────────────────────────────────────
+    valid = {c: s for c, s in scores.items() if s > -900}
+    if not valid:
+        target_col = cols[-1]
+        return target_col, "LOW", "All columns look like IDs; defaulting to last", scores
+
+    target_col    = max(valid, key=valid.get)
+    best_score    = valid[target_col]
+    sorted_scores = sorted(valid.values(), reverse=True)
+    margin        = best_score - (sorted_scores[1] if len(sorted_scores) > 1 else 0)
+
+    if best_score >= 80 and margin >= 25:
+        confidence = "HIGH"
+    elif best_score >= 40 or margin >= 12:
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW"
+
+    reason = f"score={best_score:.0f}, margin={margin:.0f}  [{reasons.get(target_col, '')}]"
+    return target_col, confidence, reason, scores
+
+
+def print_target_inference_report(df, target_col, confidence, reason, scores):
+    """Print a formatted target-inference report to the terminal."""
+    banner("TARGET COLUMN INFERENCE")
+
+    n_cols = len(df.columns)
+    section(f"Scoring all {n_cols} column(s) for target likelihood")
+
+    sorted_cols = sorted(
+        [(c, s) for c, s in scores.items() if s > -900],
+        key=lambda x: x[1], reverse=True
+    )
+    suppressed = [(c, s) for c, s in scores.items() if s <= -900]
+
+    max_score = sorted_cols[0][1] if sorted_cols else 1.0
+    print(f"  {'Column':<30} {'Score':>7}  Bar                         Notes")
+    print("  " + "─" * 75)
+    for col, score in sorted_cols:
+        bar    = "█" * int(max(score, 0) / max(max_score, 1) * 30)
+        winner = "  ← SELECTED" if col == target_col else ""
+        print(f"  {col:<30} {score:>7.1f}  {bar:<30}{winner}")
+
+    if suppressed:
+        print(f"\n  Suppressed (ID-like columns):")
+        for col, _ in suppressed:
+            print(f"    • {col}")
+
+    section("Decision")
+    conf_icon = {"HIGH": "✅", "MEDIUM": "🟡", "LOW": "⚠ "}.get(confidence, "❓")
+    print(f"  {conf_icon}  Target column  : '{target_col}'")
+    print(f"      Confidence   : {confidence}")
+    print(f"      Reason       : {reason}")
+
+    if confidence == "LOW":
+        print(f"\n  ⚠  Low confidence — verify this is the correct target column.")
+        print(f"     Override by passing y= explicitly to run_pipeline_from_df().")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CATEGORICAL COLUMN DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def detect_categorical_columns(X, feature_names, max_unique_ratio=0.05,
+                                max_unique_abs=20):
+    """
+    Detect categorical columns from a numpy array or DataFrame.
+
+    A column is flagged as categorical if ALL of the following hold:
+      • dtype is object / string  OR  integer with few unique values
+      • number of unique values ≤ max_unique_abs  OR
+        unique-to-sample ratio ≤ max_unique_ratio
+      • not binary-float (0.0/1.0 with no other values)
+
+    Returns
+    -------
+    cat_indices : list[int]   — column positions flagged as categorical
+    cat_names   : list[str]   — corresponding feature names
+    reason_map  : dict        — name → reason string (for display)
+    """
+    n = X.shape[0] if hasattr(X, "shape") else len(X)
+    cat_indices, cat_names, reason_map = [], [], {}
+
+    for i, name in enumerate(feature_names):
+        col = X[:, i] if isinstance(X, np.ndarray) else X.iloc[:, i].values
+
+        # Check dtype
+        is_obj = col.dtype == object or str(col.dtype).startswith(("str", "U", "<U"))
+
+        # Unique value stats (ignore NaN)
+        try:
+            valid   = col[~pd.isnull(col)]
+            uniques = np.unique(valid.astype(str) if is_obj else valid)
+        except Exception:
+            continue
+
+        n_unique = len(uniques)
+        ratio    = n_unique / max(n, 1)
+
+        if is_obj:
+            reason = f"string dtype  ({n_unique} unique values)"
+            cat_indices.append(i)
+            cat_names.append(name)
+            reason_map[name] = reason
+            continue
+
+        # Integer/float with very few levels → treat as categorical
+        if col.dtype in (int, np.int32, np.int64, np.int16, np.int8):
+            if n_unique <= max_unique_abs:
+                reason = f"integer with {n_unique} unique values"
+                cat_indices.append(i)
+                cat_names.append(name)
+                reason_map[name] = reason
+            continue
+
+        # Float column — only flag if it looks like an encoded category
+        # (few unique values, all whole numbers, not a 0/1 binary flag)
+        if col.dtype in (float, np.float32, np.float64):
+            whole = np.all(valid == np.floor(valid))
+            binary = set(uniques.tolist()).issubset({0.0, 1.0})
+            if whole and not binary and n_unique <= max_unique_abs and ratio <= max_unique_ratio:
+                reason = f"float with {n_unique} whole-number levels (ratio={ratio:.3f})"
+                cat_indices.append(i)
+                cat_names.append(name)
+                reason_map[name] = reason
+
+    return cat_indices, cat_names, reason_map
+
+
 def dataset_health_report(X, y, feature_names, task_type):
     banner("STEP 0 — DATASET HEALTH REPORT")
 
@@ -132,18 +471,39 @@ def dataset_health_report(X, y, feature_names, task_type):
     n, p     = X.shape
     is_clf   = task_type == "classification"
 
+    # ── Build a safe numeric-only view (shared helper) ───────────────────────
+    X_num, num_feature_names, cat_col_names = _numeric_X(X, feature_names)
+    p_num = X_num.shape[1]
+
     # ── 1. Missing values ─────────────────────────────────────────────────────
     section("Missing Values")
-    nan_counts = np.sum(np.isnan(X), axis=0)
-    total_nans = int(nan_counts.sum())
+    if p_num > 0:
+        nan_counts = np.sum(np.isnan(X_num), axis=0)
+        total_nans = int(nan_counts.sum())
+    else:
+        nan_counts = np.array([])
+        total_nans = 0
+
+    # Also check object columns for None / NaN strings
+    for cname in cat_col_names:
+        i_orig = feature_names.index(cname)
+        n_null = int(np.sum(X[:, i_orig] == None) +   # noqa: E711
+                     np.sum(pd.isnull(X[:, i_orig])))
+        if n_null > 0:
+            total_nans += n_null
+            pct = n_null / n * 100
+            print(f"  🟡 WARNING   {cname:<25}: {n_null} missing  ({pct:.1f}%)  [categorical]")
+            issues.append(("WARNING", f"{cname} has {pct:.1f}% missing values",
+                           "Impute or drop before training"))
+
     if total_nans == 0:
         print("  ✅ No missing values detected")
     else:
-        for i, name in enumerate(feature_names):
-            if nan_counts[i] > 0:
-                pct = nan_counts[i] / n * 100
+        for ii, name in enumerate(num_feature_names):
+            if nan_counts[ii] > 0:
+                pct = nan_counts[ii] / n * 100
                 sev = "🔴 CRITICAL" if pct > 30 else "🟡 WARNING"
-                print(f"  {sev}  {name:<25}: {nan_counts[i]} missing  ({pct:.1f}%)")
+                print(f"  {sev}  {name:<25}: {int(nan_counts[ii])} missing  ({pct:.1f}%)")
                 issues.append(("WARNING", f"{name} has {pct:.1f}% missing values",
                                "Impute or drop before training"))
 
@@ -184,8 +544,8 @@ def dataset_health_report(X, y, feature_names, task_type):
     section("Low-Variance / Constant Features")
     zero_var = []
     low_var  = []
-    for i, name in enumerate(feature_names):
-        v = float(np.var(X[:, i]))
+    for i, name in enumerate(num_feature_names):
+        v = float(np.var(X_num[:, i]))
         if v < 1e-10:
             zero_var.append(name)
         elif v < 0.01:
@@ -207,13 +567,13 @@ def dataset_health_report(X, y, feature_names, task_type):
     section("Multicollinearity (Feature–Feature Correlation)")
     print("  Checking all feature pairs for high correlation (|r| > 0.85):\n")
     high_corr_pairs = []
-    for i in range(p):
-        for j in range(i+1, p):
-            if p > 50 and j - i > 20:   # skip distant pairs for huge datasets
+    for i in range(p_num):
+        for j in range(i+1, p_num):
+            if p_num > 50 and j - i > 20:   # skip distant pairs for huge datasets
                 continue
-            r = float(np.corrcoef(X[:, i], X[:, j])[0, 1])
+            r = float(np.corrcoef(X_num[:, i], X_num[:, j])[0, 1])
             if abs(r) > 0.85:
-                high_corr_pairs.append((feature_names[i], feature_names[j], r))
+                high_corr_pairs.append((num_feature_names[i], num_feature_names[j], r))
 
     if not high_corr_pairs:
         print("  ✅ No highly correlated feature pairs found (|r| ≤ 0.85)")
@@ -238,8 +598,8 @@ def dataset_health_report(X, y, feature_names, task_type):
         y_num = y.astype(float)
 
     leakage_pairs = []
-    for i, name in enumerate(feature_names):
-        col = X[:, i].astype(float)
+    for i, name in enumerate(num_feature_names):
+        col = X_num[:, i].astype(float)
         col_std = col.std()
         if col_std < 1e-10:
             continue
@@ -286,8 +646,11 @@ def dataset_health_report(X, y, feature_names, task_type):
 
     # ── 7. Duplicate rows ────────────────────────────────────────────────────
     section("Duplicate Rows")
-    uniq = len(np.unique(X, axis=0))
-    dups = n - uniq
+    try:
+        uniq = len(np.unique(X_num, axis=0))
+        dups = n - uniq
+    except Exception:
+        dups = 0  # skip if array isn't hashable
     if dups > 0:
         pct = dups / n * 100
         sev = "🔴" if pct > 10 else "🟡"
@@ -301,8 +664,8 @@ def dataset_health_report(X, y, feature_names, task_type):
     section("Outlier Detection (Z-score > 3.5)")
     total_outliers = 0
     outlier_features = []
-    for i, name in enumerate(feature_names):
-        col  = X[:, i].astype(float)
+    for i, name in enumerate(num_feature_names):
+        col  = X_num[:, i].astype(float)
         std  = col.std()
         if std < 1e-10:
             continue
@@ -371,24 +734,38 @@ def analyze_data(X, y, feature_names, task_type):
     section("Feature Statistics (first 8 features)")
     stats_rows = []
     for i, name in enumerate(feature_names[:8]):
-        col = X[:, i]
-        stats_rows.append([
-            name[:16],
-            f"{np.mean(col):.3g}",
-            f"{np.std(col):.3g}",
-            f"{np.min(col):.3g}",
-            f"{np.max(col):.3g}",
-            f"{np.sum(np.isnan(col))}",
-        ])
+        col = _to_float_col(X, i)
+        if col is None:
+            # Categorical column — show cardinality instead of numeric stats
+            raw = X[:, i] if isinstance(X, np.ndarray) else np.asarray(X.iloc[:, i])
+            n_uniq = len(set(raw))
+            stats_rows.append([name[:16], "categorical", f"{n_uniq} unique", "-", "-", "-"])
+        else:
+            nan_count = int(np.sum(np.isnan(col)))
+            finite    = col[np.isfinite(col)]
+            stats_rows.append([
+                name[:16],
+                f"{np.mean(finite):.3g}"  if len(finite) else "N/A",
+                f"{np.std(finite):.3g}"   if len(finite) else "N/A",
+                f"{np.min(finite):.3g}"   if len(finite) else "N/A",
+                f"{np.max(finite):.3g}"   if len(finite) else "N/A",
+                str(nan_count),
+            ])
     table(["Feature", "Mean", "Std", "Min", "Max", "NaNs"], stats_rows)
 
     section("Correlation with Target (top 8)")
     if task_type == "regression":
         correlations = []
         for i, name in enumerate(feature_names):
-            corr = np.corrcoef(X[:, i], y)[0, 1]
-            if not np.isnan(corr):
-                correlations.append((name, corr))
+            col = _to_float_col(X, i)
+            if col is None:
+                continue   # skip categorical columns
+            try:
+                corr = np.corrcoef(col, y)[0, 1]
+                if not np.isnan(corr):
+                    correlations.append((name, corr))
+            except Exception:
+                pass
         correlations.sort(key=lambda x: abs(x[1]), reverse=True)
         for name, corr in correlations[:8]:
             bar = "▓" * int(abs(corr) * 30)
@@ -647,6 +1024,235 @@ def explain_lgbm(model, feature_names):
     imp_pairs = list(zip(feature_names, importances))
     imp_pairs.sort(key=lambda x: x[1], reverse=True)
     bar_chart([(n[:20], v) for n, v in imp_pairs[:10]])
+
+
+def explain_catboost(model, feature_names):
+    section("CatBoost Internals")
+
+    params = model.get_params()
+    key_params = ["iterations", "learning_rate", "depth", "l2_leaf_reg",
+                  "loss_function", "eval_metric", "bootstrap_type",
+                  "od_type", "od_wait"]
+    for k in key_params:
+        if k in params and params[k] is not None:
+            info(k, params[k])
+
+    subsection("Why CatBoost was selected")
+    print(textwrap.fill(
+        "  CatBoost was automatically selected because categorical columns were "
+        "detected in the dataset. CatBoost handles categorical features natively "
+        "using ordered target statistics — no one-hot encoding or label encoding "
+        "required. This avoids target leakage and often outperforms manual encoding.",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+
+    subsection("Categorical Feature Handling — Ordered Target Statistics")
+    print(textwrap.fill(
+        "  For each categorical value CatBoost computes a running target mean "
+        "using only rows that appeared BEFORE the current row in a random permutation "
+        "(ordered boosting). This prevents the model from seeing the target "
+        "when encoding the category, eliminating target leakage that affects "
+        "naive mean-encoding approaches.",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+
+    subsection("Feature Importances (PredictionValuesChange)")
+    try:
+        importances = model.get_feature_importance()
+        imp_pairs   = list(zip(feature_names, importances))
+        imp_pairs.sort(key=lambda x: x[1], reverse=True)
+        print(f"\n  {'Feature':<25} {'Importance':>11}  Bar")
+        print("  " + "─" * 55)
+        max_imp = imp_pairs[0][1] if imp_pairs else 1.0
+        for name, imp in imp_pairs[:12]:
+            bar = "█" * int(imp / max(max_imp, 1e-9) * 40)
+            print(f"  {name:<25} {imp:>11.4f}  {bar}")
+    except Exception as e:
+        print(f"  (feature importances unavailable: {e})")
+
+    subsection("SHAP-style Interaction Importances (top pairs)")
+    try:
+        inter = model.get_feature_importance(type="Interaction")
+        if inter is not None and len(inter) > 0:
+            print(f"\n  {'Feature A':<22}  {'Feature B':<22}  {'Score':>10}")
+            print("  " + "─" * 58)
+            for row in inter[:8]:
+                fi, fj, score = int(row[0]), int(row[1]), float(row[2])
+                na = feature_names[fi] if fi < len(feature_names) else f"f{fi}"
+                nb = feature_names[fj] if fj < len(feature_names) else f"f{fj}"
+                bar = "█" * int(min(score / max(float(inter[0][2]), 1e-9) * 30, 30))
+                print(f"  {na[:21]:<22}  {nb[:21]:<22}  {score:>10.2f}  {bar}")
+        else:
+            print("  (interaction importance not available for this model)")
+    except Exception:
+        print("  (interaction importance requires CatBoost ≥ 0.26 and fitted model)")
+
+    subsection("Boosting rounds summary")
+    try:
+        n_trees = model.tree_count_
+        info("Total trees built", n_trees)
+        info("Best iteration",    getattr(model, "best_iteration_", "N/A"))
+    except Exception:
+        pass
+
+
+def _catboost_learning_trace(model, X_train, y_train, X_test, y_test,
+                              feature_names, task_type, cat_indices):
+    is_clf = task_type == "classification"
+
+    # ── A) Training log ───────────────────────────────────────────────────────
+    section("A) CatBoost Training Log — Loss Per Round")
+    print(textwrap.fill(
+        "  CatBoost minimises log-loss (classification) or RMSE (regression) "
+        "round by round. Each tree fits the gradient of the loss on a random "
+        "permutation of the data — this 'ordered boosting' prevents overfitting "
+        "and is unique to CatBoost.",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+    print()
+
+    try:
+        evals  = model.get_evals_result()
+        # evals is a dict like {"learn": {"Logloss": [...]}, "validation": {...}}
+        learn_key  = list(evals.keys())[0]           # e.g. "learn"
+        metric_key = list(evals[learn_key].keys())[0] # e.g. "Logloss"
+        train_losses = evals[learn_key][metric_key]
+
+        val_losses = None
+        if len(evals) > 1:
+            val_key  = list(evals.keys())[1]
+            val_losses = evals[val_key].get(metric_key)
+
+        n_rounds = len(train_losses)
+        step     = max(1, n_rounds // 15)
+
+        print(f"  {'Round':>7}  {'Train':>12}  {'Val':>12}  {'Gap':>9}  Progress bar")
+        print("  " + "─" * 65)
+        for i in range(0, n_rounds, step):
+            tl = train_losses[i]
+            vl = val_losses[i] if val_losses else None
+            g  = (tl - vl) if vl is not None else 0.0
+            bar = "█" * int((1 - tl / (max(train_losses) + 1e-9)) * 20)
+            vs  = f"{vl:>12.6f}" if vl is not None else f"{'N/A':>12}"
+            gs  = f"{g:>+9.4f}"  if vl is not None else f"{'N/A':>9}"
+            print(f"  {i+1:>7}  {tl:>12.6f}  {vs}  {gs}  {bar}")
+
+        print(f"\n  Initial {metric_key}: {train_losses[0]:.6f}")
+        print(f"  Final   {metric_key}: {train_losses[-1]:.6f}")
+        print(f"  Reduction: {(train_losses[0]-train_losses[-1])/train_losses[0]*100:.2f}%")
+
+    except Exception as e:
+        print(f"  (training log unavailable: {e})")
+        print(f"  Tip: pass eval_set to fit() to enable validation tracking")
+
+    # ── B) Categorical encoding — what values each cat column learned ─────────
+    section("B) Categorical Column Encoding — Learned Target Statistics")
+    print(textwrap.fill(
+        "  For each categorical feature, CatBoost builds an internal "
+        "mapping: category → numeric statistic. Below shows how each "
+        "category maps to the average target (a proxy for the internal encoding).",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+    print()
+
+    X_arr = X_train if isinstance(X_train, np.ndarray) else np.array(X_train)
+    for ci in cat_indices[:4]:   # show at most 4 cat columns
+        if ci >= X_arr.shape[1]:
+            continue
+        col  = X_arr[:, ci].astype(str)
+        name = feature_names[ci] if ci < len(feature_names) else f"col_{ci}"
+        uniq = np.unique(col)
+        if len(uniq) > 20:
+            print(f"  {name}: {len(uniq)} unique values — skipping (too many to display)")
+            continue
+        print(f"\n  Feature: '{name}'  ({len(uniq)} categories)")
+        print(f"  {'Category':<25}  {'Count':>7}  {'Target mean':>12}  Distribution bar")
+        print("  " + "─" * 60)
+        stats = []
+        for val in uniq:
+            mask   = col == val
+            n_val  = int(mask.sum())
+            t_mean = float(y_train[mask].astype(float).mean()) if n_val > 0 else 0.0
+            stats.append((val, n_val, t_mean))
+        stats.sort(key=lambda x: x[2], reverse=True)
+        max_tm = max(abs(s[2]) for s in stats) + 1e-9
+        for val, n_val, t_mean in stats[:15]:
+            bar = "█" * int(abs(t_mean) / max_tm * 25)
+            sign = "+" if t_mean >= 0 else "-"
+            print(f"  {str(val)[:24]:<25}  {n_val:>7}  {t_mean:>12.4f}  {sign}{bar}")
+
+    # ── C) Sample predictions with categorical context ────────────────────────
+    section("C) Sample Predictions — Categorical Feature Contribution")
+    print(textwrap.fill(
+        "  For each sample, shows which categorical values were present and "
+        "how confident the model was. CatBoost uses the learned target statistics "
+        "for each category internally during the tree walk.",
+        width=WIDTH, initial_indent="  ", subsequent_indent="  "))
+    print()
+
+    try:
+        Pool_obj   = Pool(X_test, label=y_test,
+                          cat_features=cat_indices if cat_indices else None)
+        preds      = model.predict(Pool_obj)
+        if is_clf:
+            probas = model.predict_proba(Pool_obj)
+        else:
+            probas = None
+
+        X_test_arr = X_test if isinstance(X_test, np.ndarray) else np.array(X_test)
+
+        for s_idx in range(min(3, len(X_test_arr))):
+            print(f"\n  {'─'*65}")
+            true_lbl = y_test[s_idx]
+            pred_lbl = preds[s_idx]
+            print(f"  Sample #{s_idx+1}  |  True={true_lbl}  |  Pred={pred_lbl}", end="")
+            if probas is not None:
+                print(f"  |  Prob(class 1)={probas[s_idx][1]:.4f}", end="")
+            print()
+
+            print(f"\n  Categorical feature values for this sample:")
+            for ci in cat_indices[:6]:
+                if ci >= X_test_arr.shape[1]:
+                    continue
+                cname  = feature_names[ci] if ci < len(feature_names) else f"col_{ci}"
+                cval   = X_test_arr[s_idx, ci]
+                # Lookup target mean from training data as a proxy
+                col_tr = X_arr[:, ci].astype(str)
+                mask   = col_tr == str(cval)
+                if mask.sum() > 0:
+                    tmean = float(y_train[mask].astype(float).mean())
+                    print(f"    {cname:<25}: '{cval}'  "
+                          f"(train target mean for this category: {tmean:.4f})")
+                else:
+                    print(f"    {cname:<25}: '{cval}'  (unseen in training → fallback encoding)")
+
+            print(f"\n  Numeric feature values:")
+            for fi, fname in enumerate(feature_names):
+                if fi in cat_indices or fi >= X_test_arr.shape[1]:
+                    continue
+                fval = X_test_arr[s_idx, fi]
+                print(f"    {fname:<25}: {fval:.4f}")
+            print()
+
+    except Exception as e:
+        print(f"  (sample walkthrough unavailable: {e})")
+
+    # ── D) Feature importance breakdown ──────────────────────────────────────
+    section("D) Categorical vs Numeric Feature Importance")
+    try:
+        importances = model.get_feature_importance()
+        cat_imp  = sum(importances[ci] for ci in cat_indices if ci < len(importances))
+        num_imp  = sum(importances[fi] for fi in range(len(importances))
+                       if fi not in cat_indices)
+        total    = cat_imp + num_imp + 1e-9
+        cat_bar  = "█" * int(cat_imp / total * 40)
+        num_bar  = "█" * int(num_imp / total * 40)
+        print(f"\n  Categorical features total importance:  {cat_imp:>8.2f}  "
+              f"({cat_imp/total*100:.1f}%)  {cat_bar}")
+        print(f"  Numeric features total importance:      {num_imp:>8.2f}  "
+              f"({num_imp/total*100:.1f}%)  {num_bar}")
+        if cat_imp / total > 0.5:
+            print(f"\n  ℹ  Categorical features drive >50% of predictive power.")
+            print(f"     CatBoost's native encoding is giving them full weight.")
+        print()
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1104,6 +1710,9 @@ def explain_model(model, feature_names, task_type):
     elif HAS_LGB and name in ("LGBMClassifier", "LGBMRegressor"):
         explain_lgbm(model, feature_names)
 
+    elif HAS_CB and name in ("CatBoostClassifier", "CatBoostRegressor"):
+        explain_catboost(model, feature_names)
+
     else:
         section("Model Internals")
         info("Model", name)
@@ -1128,7 +1737,7 @@ def walkthrough_predictions(model, X_test, y_test, feature_names, task_type, n=5
         print(f"  {'─'*60}")
         print(f"  Input features:")
         for j, (name, val) in enumerate(zip(feature_names[:8], X_test[i, :8])):
-            print(f"    {name:<22}: {val:.4f}")
+            print(f"    {name:<22}: {_fmt_val(val)}")
         if len(feature_names) > 8:
             print(f"    ... ({len(feature_names) - 8} more features)")
 
@@ -1362,6 +1971,22 @@ def overfitting_diagnosis(model, X_train, y_train, X_test, y_test,
             causes.append("LinearRegression has no regularization — can overfit with many features")
             fixes.append("Switch to Ridge or Lasso for built-in regularization")
 
+    elif HAS_CB and model_name in ("CatBoostClassifier", "CatBoostRegressor"):
+        params = model.get_params()
+        depth  = params.get("depth", "?")
+        iters  = params.get("iterations", "?")
+        lr     = params.get("learning_rate", "?")
+        print(f"  Model:          CatBoost  (iters={iters}, depth={depth}, lr={lr})")
+        if regime in ("OVERFITTING", "MILD_OVERFIT"):
+            if isinstance(depth, int) and depth > 8:
+                causes.append(f"Deep trees (depth={depth}) — CatBoost default is 6")
+                fixes.append("Reduce depth to 4-6")
+            if isinstance(lr, float) and lr > 0.2:
+                causes.append(f"High learning rate ({lr})")
+                fixes.append("Lower learning_rate to 0.01-0.1")
+            causes.append("Consider adding l2_leaf_reg (default=3) or bagging_fraction")
+            fixes.append("Set l2_leaf_reg=5-10, rsm=0.8 (random subspace method)")
+
     # Data-side causes
     print()
     samples_per_feat = n_train / n_features
@@ -1532,7 +2157,8 @@ def validate_model(model, X, y, X_train, y_train, X_test, y_test,
                                 "BaggingClassifier",      "BaggingRegressor")
     is_xgb     = HAS_XGB and model_name in ("XGBClassifier", "XGBRegressor")
     is_lgb     = HAS_LGB and model_name in ("LGBMClassifier", "LGBMRegressor")
-    is_boosted = is_xgb or is_lgb
+    is_boosted  = is_xgb or is_lgb
+    is_catboost = HAS_CB and model_name in ("CatBoostClassifier", "CatBoostRegressor")
 
     section("Strategy Selection")
     info("Model",        model_name)
@@ -1688,6 +2314,88 @@ def validate_model(model, X, y, X_train, y_train, X_test, y_test,
             test_s = model.score(X_test, y_test)
             info("Holdout score", f"{test_s:.4f}")
 
+        return
+
+    # ── METHOD 2b — CatBoost manual CV (can't be sklearn-cloned) ───────────────
+    if is_catboost:
+        # sklearn.cross_val_score calls clone(estimator) which fails for CatBoost
+        # because cat_features is set in __init__ but not exposed via get_params()
+        # in a way that survives sklearn's clone(). We run k-fold manually instead.
+        method = f"Manual {cv}-Fold CV (CatBoost — sklearn clone not supported)"
+        info("Method chosen", f"✦ {method}")
+        info("Reason", "CatBoost stores cat_features internally; sklearn.clone() cannot reproduce it")
+
+        section(f"Method: {method}")
+        print(f"  Running {cv} folds manually with CatBoost Pool objects.\n")
+
+        from sklearn.model_selection import KFold
+        from sklearn.metrics import r2_score, accuracy_score
+        import copy
+
+        kf      = KFold(n_splits=cv, shuffle=True, random_state=random_state)
+        scores_ = []
+        cat_idx = list(getattr(model, "_init_params", {}).get("cat_features", []) or
+                       getattr(model, "get_param", lambda k, d=None: d)("cat_features") or [])
+
+        # Fallback: re-detect cat_features from X directly
+        if not cat_idx:
+            for ci in range(X.shape[1]):
+                col = _to_float_col(X, ci)
+                if col is None:
+                    cat_idx.append(ci)
+
+        t0 = time.perf_counter()
+        for fold, (train_idx, val_idx) in enumerate(kf.split(X), 1):
+            X_tr, X_val = X[train_idx], X[val_idx]
+            y_tr, y_val = y[train_idx], y[val_idx]
+
+            try:
+                base_params = dict(model.get_params())
+                # Avoid duplicate kwargs when rebuilding CatBoost models per fold.
+                base_params.pop("verbose", None)
+                if cat_idx:
+                    train_pool = Pool(X_tr, label=y_tr, cat_features=cat_idx)
+                    val_pool   = Pool(X_val, label=y_val, cat_features=cat_idx)
+                    base_params.pop("cat_features", None)
+                    fold_model = (CatBoostClassifier if task_type == "classification"
+                                  else CatBoostRegressor)(
+                        **base_params,
+                        cat_features=cat_idx,
+                        verbose=0,
+                    )
+                    fold_model.fit(train_pool, eval_set=val_pool)
+                else:
+                    fold_model = (CatBoostClassifier if task_type == "classification"
+                                  else CatBoostRegressor)(
+                        **base_params, verbose=0
+                    )
+                    fold_model.fit(X_tr, y_tr)
+
+                preds = fold_model.predict(X_val)
+                if task_type == "classification":
+                    s = accuracy_score(y_val, preds)
+                else:
+                    s = r2_score(y_val, preds)
+                scores_.append(s)
+                bar = "█" * int(max(0, s) * 30)
+                print(f"  Fold {fold}/{cv}: {bar:<30} {scoring}={s:.4f}")
+            except Exception as e:
+                print(f"  Fold {fold}/{cv}: ⚠  failed ({e})")
+
+        elapsed = time.perf_counter() - t0
+        scores  = np.array(scores_) if scores_ else np.array([0.0])
+        info("Time", f"{elapsed:.3f}s  ({elapsed/cv:.3f}s per fold)")
+        _print_scores(scores)
+
+        subsection("Stability Verdict")
+        cv_std = scores.std()
+        if cv_std < 0.02:
+            print("  ✅ STABLE    — std < 0.02, model is consistent across folds")
+        elif cv_std < 0.05:
+            print("  ℹ  MODERATE  — std 0.02–0.05, some variance, acceptable")
+        else:
+            print("  ⚠  UNSTABLE  — std > 0.05, high variance across folds")
+        info("Std across folds", f"{cv_std:.4f}")
         return
 
     # ── METHOD 3 — Full k-Fold CV  (small datasets < 5k) ─────────────────────
@@ -2389,7 +3097,7 @@ def _tree_learning_trace(model, X_train, y_train, X_test, y_test,
                 thr   = tree.threshold[node_id]
                 sv    = X_test[s_idx, tree.feature[node_id]]
                 went  = "LEFT (TRUE)" if sv <= thr else "RIGHT (FALSE)"
-                print(f"{indent}[SPLIT] node {node_id}: {feat}={sv:.4f} <= {thr:.4f}? -> {went}")
+                print(f"{indent}[SPLIT] node {node_id}: {feat}={_fmt_val(sv)} <= {thr:.4f}? -> {went}")
 
     section("C) Feature Impurity Reduction")
     imps  = model.feature_importances_
@@ -3219,7 +3927,7 @@ def _sgd_learning_trace(model, X_train, y_train, X_test, y_test,
 
 
 def learning_trace(model, X_train, y_train, X_test, y_test,
-                   feature_names, task_type):
+                   feature_names, task_type, cat_indices=None):
     """Routes to the right tracer based on model type."""
     banner("STEP 9 -- LEARNING TRACE  (How the Model Learned)")
     model_name = type(model).__name__
@@ -3260,6 +3968,10 @@ def learning_trace(model, X_train, y_train, X_test, y_test,
     elif model_name in ("SGDClassifier", "SGDRegressor"):
         _sgd_learning_trace(model, X_train, y_train, X_test, y_test,
                              feature_names, task_type)
+    elif HAS_CB and model_name in ("CatBoostClassifier", "CatBoostRegressor"):
+        _catboost_learning_trace(model, X_train, y_train, X_test, y_test,
+                                 feature_names, task_type,
+                                 cat_indices=cat_indices or [])
     else:
         section("Generic Feature Influence")
         print(f"  No deep tracer for {model_name} yet -- showing permutation importance.")
@@ -3284,12 +3996,21 @@ def run_pipeline(model, X, y, feature_names=None, task_type=None,
     feature_names: list of str (auto-detected from DataFrame)
     task_type    : "classification" or "regression" (auto-detected)
     test_size    : fraction for test split (default 0.2)
-    scale        : apply StandardScaler (default True)
+    scale        : apply StandardScaler (default True; auto-disabled for CatBoost)
     cv           : number of cross-val folds (default 5)
     n_walkthrough: samples to walk through in detail (default 5)
+
+    CatBoost auto-selection
+    -----------------------
+    If categorical columns are detected AND catboost is installed, the pipeline
+    will automatically swap the user-supplied model for a CatBoostClassifier /
+    CatBoostRegressor and disable StandardScaler (CatBoost handles raw features
+    natively and scaling is unnecessary and occasionally harmful).
+    Pass model=CatBoostClassifier(...) explicitly to use custom CatBoost params.
     """
 
     # ── Coerce inputs ──────────────────────────────────────────────────────────
+    X_orig = X   # keep original DataFrame reference for detection
     if isinstance(X, pd.DataFrame):
         if feature_names is None:
             feature_names = list(X.columns)
@@ -3304,6 +4025,35 @@ def run_pipeline(model, X, y, feature_names=None, task_type=None,
         unique_y = np.unique(y)
         task_type = "classification" if len(unique_y) <= 20 and y.dtype in (int, np.int32, np.int64, object) else "regression"
 
+    # ── Detect categorical columns ─────────────────────────────────────────────
+    cat_indices, cat_names, cat_reason_map = detect_categorical_columns(
+        X_orig if isinstance(X_orig, pd.DataFrame) else X,
+        feature_names
+    )
+
+    # ── CatBoost auto-swap ─────────────────────────────────────────────────────
+    model_was_swapped = False
+    if cat_indices and HAS_CB:
+        model_name = type(model).__name__
+        if model_name not in ("CatBoostClassifier", "CatBoostRegressor"):
+            # Swap to CatBoost and disable scaling
+            if task_type == "classification":
+                model = CatBoostClassifier(
+                    iterations=500, depth=6, learning_rate=0.05,
+                    l2_leaf_reg=3, loss_function="Logloss",
+                    eval_metric="Accuracy", verbose=0, random_seed=42,
+                    cat_features=cat_indices,
+                )
+            else:
+                model = CatBoostRegressor(
+                    iterations=500, depth=6, learning_rate=0.05,
+                    l2_leaf_reg=3, loss_function="RMSE",
+                    eval_metric="RMSE", verbose=0, random_seed=42,
+                    cat_features=cat_indices,
+                )
+            scale             = False   # CatBoost works on raw values
+            model_was_swapped = True
+
     # ── Run all steps ──────────────────────────────────────────────────────────
     banner("ML TRANSPARENCY PIPELINE", "█")
     print(f"  Model   : {type(model).__name__}")
@@ -3312,7 +4062,59 @@ def run_pipeline(model, X, y, feature_names=None, task_type=None,
     print(f"  Features: {X.shape[1]}")
     print(f"  XGBoost : {'available' if HAS_XGB else 'not installed'}")
     print(f"  LightGBM: {'available' if HAS_LGB else 'not installed'}")
+    print(f"  CatBoost: {'available' if HAS_CB else 'not installed  →  pip install catboost'}")
     print(f"  Optuna  : {'available' if HAS_OPTUNA else 'not installed  →  pip install optuna'}")
+
+    # ── Categorical detection report ──────────────────────────────────────────
+    if cat_indices:
+        banner("CATEGORICAL COLUMNS DETECTED", "═")
+        print(f"  Found {len(cat_indices)} categorical column(s):\n")
+        for name in cat_names:
+            print(f"    • {name:<30}  ({cat_reason_map[name]})")
+        print()
+        if HAS_CB:
+            if model_was_swapped:
+                print(f"  ✅ CatBoost is installed.")
+                print(f"     Model automatically swapped to "
+                      f"{'CatBoostClassifier' if task_type=='classification' else 'CatBoostRegressor'}.")
+                print(f"     StandardScaler disabled — CatBoost handles raw features natively.")
+            else:
+                print(f"  ✅ CatBoost is installed and already set as the model.")
+        else:
+            print(f"  ⚠  CatBoost is NOT installed.")
+            print(f"     Install it with:  pip install catboost")
+            print(f"     Continuing with {type(model).__name__} — categorical columns")
+            print(f"     will be treated as numeric (label-encoded or as-is).")
+            print(f"     For best results with categorical data, install CatBoost.")
+        print()
+    else:
+        print(f"  Categorical: none detected — using {type(model).__name__} as supplied.")
+
+    # ── Label-encode string columns for non-CatBoost models ─────────────────
+    # CatBoost receives the raw object array and handles encoding internally.
+    # All other sklearn/XGBoost/LightGBM models require a numeric-only array.
+    # We ordinal-encode every string column in-place here so the rest of the
+    # pipeline always receives a float-castable array regardless of model choice.
+    model_name_now = type(model).__name__
+    is_catboost_model = model_name_now in ("CatBoostClassifier", "CatBoostRegressor")
+
+    if cat_indices and not is_catboost_model:
+        encoders = {}   # col_index -> fitted LabelEncoder (kept for walkthrough display)
+        X = X.copy().astype(object)   # ensure we can mutate without changing original
+        for ci in cat_indices:
+            le = LabelEncoder()
+            col_vals = X[:, ci].astype(str)
+            X[:, ci] = le.fit_transform(col_vals)
+            encoders[ci] = le
+        # Convert to float after encoding all columns
+        X = X.astype(np.float64)
+        print(f"  ℹ  Label-encoded {len(cat_indices)} categorical column(s) for "
+              f"{model_name_now}:")
+        for ci in cat_indices:
+            le = encoders[ci]
+            mapping = {cls: code for code, cls in enumerate(le.classes_)}
+            print(f"       {feature_names[ci]}: {mapping}")
+        print()
 
     # 0. Dataset health report
     health_issues = dataset_health_report(X, y, feature_names, task_type)
@@ -3325,8 +4127,24 @@ def run_pipeline(model, X, y, feature_names=None, task_type=None,
         X, y, test_size=test_size, scale=scale
     )
 
-    # 3. Train
-    model, elapsed = train_model(model, X_train_s, y_train)
+    # 3. Train — CatBoost needs cat_features in the Pool
+    is_catboost = HAS_CB and type(model).__name__ in ("CatBoostClassifier",
+                                                       "CatBoostRegressor")
+    if is_catboost:
+        banner("STEP 3 — TRAINING")
+        section("Training CatBoostModel with native categorical handling")
+        t0 = time.time()
+        train_pool = Pool(X_train_s, label=y_train,
+                          cat_features=cat_indices if cat_indices else None)
+        eval_pool  = Pool(X_test_s,  label=y_test,
+                          cat_features=cat_indices if cat_indices else None)
+        model.fit(train_pool, eval_set=eval_pool)
+        elapsed = time.time() - t0
+        info("Training time", f"{elapsed:.4f}s")
+        info("Trees built",   model.tree_count_)
+        info("Best iteration",getattr(model, "best_iteration_", "N/A"))
+    else:
+        model, elapsed = train_model(model, X_train_s, y_train)
 
     # 3.5. Training decision explanations
     training_decision_explanations(model, feature_names, X_train_s, y_train, task_type)
@@ -3353,7 +4171,7 @@ def run_pipeline(model, X, y, feature_names=None, task_type=None,
 
     # 9. Learning trace
     learning_trace(model, X_train_s, y_train, X_test_s, y_test,
-                   feature_names, task_type)
+                   feature_names, task_type, cat_indices=cat_indices)
 
     # ── Summary ────────────────────────────────────────────────────────────────
     banner("PIPELINE COMPLETE", "█")
@@ -3362,6 +4180,8 @@ def run_pipeline(model, X, y, feature_names=None, task_type=None,
     print(f"  Train samples  : {len(X_train)}")
     print(f"  Test  samples  : {len(X_test)}")
     print(f"  Scaler used    : {type(scaler).__name__ if scaler else 'None'}")
+    if cat_indices:
+        print(f"  Categorical cols: {len(cat_indices)}  ({', '.join(cat_names[:5])})")
     print(f"\n  The model object is returned for further use.\n")
 
     return model, scaler
@@ -3375,11 +4195,12 @@ if __name__ == "__main__":
     from sklearn.datasets import load_iris, load_diabetes, load_breast_cancer
 
     print("\n" + "═" * WIDTH)
-    print("  DEMO MODE — Running 3 pipeline examples + 1 Optuna tuning example")
+    print("  DEMO MODE — Running pipeline examples")
     print("  1) Classification: Random Forest on Iris")
     print("  2) Regression    : Gradient Boosting on Diabetes")
     print("  3) Classification: Logistic Regression on Breast Cancer")
-    print("  4) Optuna Tuning : Random Forest on Breast Cancer  (if optuna installed)")
+    print("  4) CatBoost      : Auto-selected on synthetic dataset with categoricals")
+    print("  5) Optuna Tuning : Random Forest on Breast Cancer  (if optuna installed)")
     print("═" * WIDTH)
 
     # ── Demo 1: Classification ────────────────────────────────────────────────
@@ -3425,9 +4246,50 @@ if __name__ == "__main__":
     run_pipeline(model_lr, X_bc, y_bc, feature_names=list(feat_bc),
                  task_type="classification", scale=True, cv=5, n_walkthrough=3)
 
-    # ── Demo 4: Optuna Tuning ─────────────────────────────────────────────────
+    # ── Demo 4: CatBoost auto-selection ──────────────────────────────────────
     print("\n\n" + "█" * WIDTH)
-    print("  DEMO 4 of 4 — Optuna Tuning — Random Forest on Breast Cancer")
+    print("  DEMO 4 of 5 — CatBoost Auto-Selection on Synthetic Categorical Dataset")
+    print("█" * WIDTH)
+
+    import random as _random
+    _rng = np.random.default_rng(42)
+    n_demo = 500
+    # Synthetic features: 2 numeric + 2 categorical
+    num_feat1 = _rng.normal(0, 1, n_demo)
+    num_feat2 = _rng.normal(5, 2, n_demo)
+    cat_feat1 = _rng.choice(["red", "green", "blue"], n_demo)    # object dtype
+    cat_feat2 = _rng.integers(0, 4, n_demo)                      # integer with 4 levels
+    # Target: driven mostly by cat_feat1 and num_feat1
+    label_map = {"red": 0.8, "green": 0.3, "blue": 0.6}
+    prob = np.array([label_map[c] for c in cat_feat1]) * 0.6 + \
+           (num_feat1 > 0).astype(float) * 0.4
+    y_demo = (prob + _rng.normal(0, 0.05, n_demo) > 0.5).astype(int)
+
+    X_demo_df = pd.DataFrame({
+        "num_feat1":  num_feat1,
+        "num_feat2":  num_feat2,
+        "color":      cat_feat1,          # string categorical
+        "grade":      cat_feat2,          # integer categorical
+    })
+
+    # Any model will work — CatBoost will be auto-swapped if installed
+    from sklearn.ensemble import RandomForestClassifier as _RFC
+    model_demo = _RFC(n_estimators=50, random_state=42)
+
+    print(f"\n  Dataset: {n_demo} samples, 4 features (2 numeric, 2 categorical)")
+    print(f"  Supplied model: RandomForestClassifier")
+    if HAS_CB:
+        print(f"  Expected: model auto-swapped to CatBoostClassifier\n")
+    else:
+        print(f"  CatBoost not installed — RandomForest will be used as fallback.\n")
+        print(f"  Install CatBoost with:  pip install catboost\n")
+
+    run_pipeline(model_demo, X_demo_df, y_demo,
+                 task_type="classification", scale=True, cv=3, n_walkthrough=3)
+
+    # ── Demo 5: Optuna Tuning ─────────────────────────────────────────────────
+    print("\n\n" + "█" * WIDTH)
+    print("  DEMO 5 of 5 — Optuna Tuning — Random Forest on Breast Cancer")
     print("█" * WIDTH)
 
     if HAS_OPTUNA:
@@ -3454,3 +4316,85 @@ if __name__ == "__main__":
         print(f"        n_trials=50,")
         print(f"        cv_folds=3,")
         print(f"    )")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  run_pipeline_from_df  —  Pass the whole DataFrame; target is auto-detected
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_pipeline_from_df(model, df, target_col=None,
+                         task_type=None, test_size=0.2,
+                         scale=True, cv=5, n_walkthrough=5):
+    """
+    Convenience wrapper around run_pipeline() that accepts a raw DataFrame
+    and automatically infers which column is the prediction target.
+
+    Parameters
+    ----------
+    model       : sklearn-compatible model instance
+    df          : pd.DataFrame — the full dataset (features + target together)
+    target_col  : str, optional
+                  Column name to use as y.
+                  If None, infer_target_column() picks it automatically.
+    task_type   : "classification" | "regression" | None (auto-detected from y)
+    test_size   : float  (default 0.2)
+    scale       : bool   (default True; auto-disabled for CatBoost)
+    cv          : int    (default 5)
+    n_walkthrough: int   (default 5)
+
+    Target inference rules (applied when target_col is None)
+    ─────────────────────────────────────────────────────────
+    1. Exact name match  — col name is a known target keyword
+                           (target, label, price, value, score, churn …)
+    2. Suffix/prefix     — name ends/starts with a target keyword
+                           (house_price, label_encoded, …)
+    3. Substring         — name contains a target keyword
+    4. Last column bonus — many datasets store y as the final column
+    5. Cardinality       — low unique count → classification label
+                           high-cardinality float → regression target
+    6. dtype signal      — float/int preferred; pure-string penalised
+    7. ID suppression    — columns named *id, index, rownum, uuid …
+                           are excluded from consideration entirely
+
+    Returns
+    -------
+    Same as run_pipeline(): (best_model, scaler)
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("run_pipeline_from_df() requires a pd.DataFrame as 'df'.")
+
+    # ── Infer or validate target column ───────────────────────────────────────
+    if target_col is not None:
+        if target_col not in df.columns:
+            raise ValueError(
+                f"target_col='{target_col}' not found in DataFrame. "
+                f"Available columns: {list(df.columns)}"
+            )
+        inferred_col = target_col
+        confidence   = "USER-SUPPLIED"
+        reason       = f"explicitly provided by caller"
+        scores       = {c: 0.0 for c in df.columns}
+        scores[target_col] = 999.0
+    else:
+        inferred_col, confidence, reason, scores = infer_target_column(df)
+
+    # ── Print inference report ─────────────────────────────────────────────────
+    print_target_inference_report(df, inferred_col, confidence, reason, scores)
+
+    if confidence == "LOW" and target_col is None:
+        print(f"\n  ⚠  Proceeding with '{inferred_col}' as the target column.")
+        print(f"     To override:  run_pipeline_from_df(model, df, target_col='your_col')\n")
+
+    # ── Split into X and y ─────────────────────────────────────────────────────
+    X = df.drop(columns=[inferred_col])
+    y = df[inferred_col]
+
+    # ── Delegate to run_pipeline ───────────────────────────────────────────────
+    return run_pipeline(
+        model, X, y,
+        task_type    = task_type,
+        test_size    = test_size,
+        scale        = scale,
+        cv           = cv,
+        n_walkthrough= n_walkthrough,
+    )
